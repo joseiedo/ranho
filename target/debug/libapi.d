@@ -1,1 +1,0 @@
-/Users/iedo/Study/rinha/rinha-2026/target/debug/libapi.rlib: /Users/iedo/Study/rinha/rinha-2026/api/src/lib.rs /Users/iedo/Study/rinha/rinha-2026/api/src/scorer.rs /Users/iedo/Study/rinha/rinha-2026/api/src/search.rs /Users/iedo/Study/rinha/rinha-2026/api/src/types.rs /Users/iedo/Study/rinha/rinha-2026/api/src/vectorizer.rs
