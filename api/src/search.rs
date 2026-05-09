@@ -9,8 +9,12 @@ const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 /// KNN k
 const K: usize = 5;
-/// Number of clusters to probe per query. Higher = more accurate, slower.
-const NPROBE: usize = 16;
+/// Clusters probed on first pass (fast path).
+const FAST_NPROBE: usize = 8;
+/// Clusters probed when fraud_count ∈ {2,3} (decision boundary — re-probe with more clusters).
+const FULL_NPROBE: usize = 24;
+/// Dimension split for early-exit: after this many dims, check partial dist vs heap threshold.
+const EARLY_EXIT_DIM: usize = 8;
 const SENTINEL: i8 = -127;
 /// Max squared distance for one i8 dimension (254² = 64516).
 /// Applied when exactly one of query/reference carries the sentinel on dim 5 or 6.
@@ -115,14 +119,16 @@ impl SearchIndex {
         let offsets = &self.mmap[self.offsets_byte..];
         let data = &self.mmap[self.data_byte..];
 
-        // Phase 1: dequantize query and find the top-NPROBE closest centroids.
-        // For non-negative finite f32, to_bits() preserves ordering — safe to sort as u32.
+        // Phase 1: dequantize query and find the top-FULL_NPROBE closest centroids,
+        // sorted so we can probe them in order (closest first).
         let mut query_f32 = [0.0f32; DIMS];
         for d in 0..DIMS {
             query_f32[d] = query[d] as f32 / 127.0;
         }
 
-        let nprobe = NPROBE.min(self.k_clusters);
+        let full_nprobe = FULL_NPROBE.min(self.k_clusters);
+        let fast_nprobe = FAST_NPROBE.min(full_nprobe);
+
         let mut centroid_dists: Vec<(u32, usize)> = self
             .centroids
             .iter()
@@ -136,33 +142,26 @@ impl SearchIndex {
                 (d.to_bits(), ci)
             })
             .collect();
-        // Partial sort: bring the nprobe smallest to the front.
-        centroid_dists.select_nth_unstable(nprobe - 1);
-        let probed = &centroid_dists[..nprobe];
+        // Bring the top-full_nprobe to the front, then sort them so closest come first.
+        centroid_dists.select_nth_unstable(full_nprobe - 1);
+        centroid_dists[..full_nprobe].sort_unstable();
 
-        // Phase 2: scan each probed cluster with the full sentinel-aware dist_scalar.
+        // Phase 2: scan top-fast_nprobe clusters with early-exit distance pruning.
         let mut heap: BinaryHeap<(i32, u8)> = BinaryHeap::with_capacity(K + 1);
+        scan_clusters(query, &centroid_dists[..fast_nprobe], offsets, data, &mut heap);
 
-        for &(_, ci) in probed {
-            let start = u32::from_le_bytes(
-                offsets[ci * 4..ci * 4 + 4].try_into().unwrap(),
-            ) as usize;
-            let end = u32::from_le_bytes(
-                offsets[(ci + 1) * 4..(ci + 1) * 4 + 4].try_into().unwrap(),
-            ) as usize;
-
-            for j in start..end {
-                let base = j * (DIMS + 1);
-                let dist = dist_scalar(query, &data[base..base + DIMS]);
-
-                if heap.len() < K {
-                    heap.push((dist, data[base + DIMS]));
-                } else if let Some(&(max_d, _)) = heap.peek() {
-                    if dist < max_d {
-                        heap.pop();
-                        heap.push((dist, data[base + DIMS]));
-                    }
-                }
+        // Adaptive: if fraud_count ∈ {2,3} the result sits on the decision boundary
+        // (score 0.4 or 0.6). Probe the next batch of clusters for better accuracy.
+        if full_nprobe > fast_nprobe && heap.len() == K {
+            let fraud_in_heap = heap.iter().filter(|&&(_, l)| l == 1).count();
+            if fraud_in_heap == 2 || fraud_in_heap == 3 {
+                scan_clusters(
+                    query,
+                    &centroid_dists[fast_nprobe..full_nprobe],
+                    offsets,
+                    data,
+                    &mut heap,
+                );
             }
         }
 
@@ -176,25 +175,79 @@ impl SearchIndex {
     }
 }
 
+/// Scan a list of clusters, inserting candidates into `heap` with early-exit pruning.
+/// Threshold is kept tight: updated whenever the heap changes.
+#[inline]
+fn scan_clusters(
+    query: &[i8; DIMS],
+    clusters: &[(u32, usize)],
+    offsets: &[u8],
+    data: &[u8],
+    heap: &mut BinaryHeap<(i32, u8)>,
+) {
+    for &(_, ci) in clusters {
+        let start = u32::from_le_bytes(offsets[ci * 4..ci * 4 + 4].try_into().unwrap()) as usize;
+        let end =
+            u32::from_le_bytes(offsets[(ci + 1) * 4..(ci + 1) * 4 + 4].try_into().unwrap())
+                as usize;
+
+        // threshold = worst distance in the top-K heap; i32::MAX when heap not full.
+        let mut threshold = heap.peek().map_or(i32::MAX, |&(d, _)| d);
+
+        for j in start..end {
+            let base = j * (DIMS + 1);
+            if let Some(dist) = dist_with_early_exit(query, &data[base..base + DIMS], threshold) {
+                if heap.len() < K {
+                    heap.push((dist, data[base + DIMS]));
+                    if heap.len() == K {
+                        threshold = heap.peek().unwrap().0;
+                    }
+                } else {
+                    heap.pop();
+                    heap.push((dist, data[base + DIMS]));
+                    threshold = heap.peek().unwrap().0;
+                }
+            }
+        }
+    }
+}
+
+/// Full distance — used by tests via `dist_scalar`.
 #[inline]
 fn dist_scalar(query: &[i8; DIMS], record: &[u8]) -> i32 {
+    dist_with_early_exit(query, record, i32::MAX).unwrap()
+}
+
+/// Compute squared Euclidean distance with sentinel handling and early exit.
+/// After `EARLY_EXIT_DIM` dimensions, if the partial sum already meets or exceeds
+/// `threshold`, returns `None` (vector is pruned). Dims 8-13 have no sentinels.
+#[inline]
+fn dist_with_early_exit(query: &[i8; DIMS], record: &[u8], threshold: i32) -> Option<i32> {
     let mut dist: i32 = 0;
-    for d in 0..DIMS {
+
+    // First EARLY_EXIT_DIM dims (includes sentinel dims 5 and 6).
+    for d in 0..EARLY_EXIT_DIM {
         let q = query[d];
         let r = record[d] as i8;
-        let contribution = if (d == 5 || d == 6) && (q == SENTINEL || r == SENTINEL) {
-            if q == SENTINEL && r == SENTINEL {
-                0
-            } else {
-                SENTINEL_PENALTY
-            }
+        dist += if (d == 5 || d == 6) && (q == SENTINEL || r == SENTINEL) {
+            if q == SENTINEL && r == SENTINEL { 0 } else { SENTINEL_PENALTY }
         } else {
             let diff = q as i16 - r as i16;
             (diff * diff) as i32
         };
-        dist += contribution;
     }
-    dist
+
+    if dist >= threshold {
+        return None;
+    }
+
+    // Remaining dims — no sentinels past dim 7.
+    for d in EARLY_EXIT_DIM..DIMS {
+        let diff = query[d] as i16 - record[d] as i8 as i16;
+        dist += (diff * diff) as i32;
+    }
+
+    Some(dist)
 }
 
 #[cfg(test)]
