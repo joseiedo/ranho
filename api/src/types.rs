@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct TransactionPayload {
+    #[serde(skip)]
     pub id: String,
     pub transaction: Transaction,
     pub customer: Customer,

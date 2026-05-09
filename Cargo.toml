@@ -1,3 +1,11 @@
 [workspace]
 members = ["api", "preprocessor"]
 resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+overflow-checks = false
+strip = true

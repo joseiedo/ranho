@@ -1,22 +1,35 @@
+// Converts TransactionPayload into a 14-dimensional f32 feature vector,
+// then quantizes f32 → i16 for fast integer distance computation in search.rs.
+//
+// Dimension mapping (see REGRAS_DE_DETECCAO.md):
+//   0:  amount / MAX_AMOUNT
+//   1:  installments / MAX_INSTALLMENTS
+//   2:  (amount / avg_amount) / AMOUNT_VS_AVG_RATIO
+//   3:  hour_of_day / 23          (via HOUR_LUT)
+//   4:  day_of_week / 6           (via DOW_LUT)
+//   5:  minutes_since_last / MAX_MINUTES  (sentinel -1.0 if no last tx)
+//   6:  km_from_last / MAX_KM             (sentinel -1.0 if no last tx)
+//   7:  km_from_home / MAX_KM
+//   8:  tx_count_24h / MAX_TX_COUNT_24H
+//   9:  is_online (0.0 or 1.0)
+//  10:  card_present (0.0 or 1.0)
+//  11:  unknown_merchant (0.0 or 1.0)
+//  12:  mcc_risk (risk from lookup map, default 0.5)
+//  13:  merchant_avg_amount / MAX_MERCHANT_AVG_AMOUNT
+//
+// All values clamped to [0.0, 1.0] via clamp01(), except dims 5 and 6
+// which can be -1.0 (sentinel for "no last transaction"): in i16, -1.0 → -10000.
+// This sentinel is naturally handled by the distance function — two sentinels
+// have distance 0, one sentinel vs a real value produces a penalty.
+
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 
+use crate::normalization::{
+    clamp01, AMOUNT_VS_AVG_RATIO, DEFAULT_MCC_RISK, DOW_LUT, HOUR_LUT, MAX_AMOUNT,
+    MAX_INSTALLMENTS, MAX_KM, MAX_MERCHANT_AVG_AMOUNT, MAX_MINUTES, MAX_TX_COUNT_24H,
+};
 use crate::types::TransactionPayload;
-
-const MAX_AMOUNT: f32 = 10_000.0;
-const MAX_INSTALLMENTS: f32 = 12.0;
-const AMOUNT_VS_AVG_RATIO: f32 = 10.0;
-const MAX_MINUTES: f32 = 1440.0;
-const MAX_KM: f32 = 1000.0;
-const MAX_TX_COUNT_24H: f32 = 20.0;
-const MAX_MERCHANT_AVG_AMOUNT: f32 = 10_000.0;
-const MAX_HOUR: f32 = 23.0;
-const MAX_DOW: f32 = 6.0;
-const DEFAULT_MCC_RISK: f32 = 0.5;
-
-fn clamp01(x: f32) -> f32 {
-    x.clamp(0.0, 1.0)
-}
 
 pub struct Vectorizer {
     mcc_risk: HashMap<String, f32>,
@@ -27,15 +40,15 @@ impl Vectorizer {
         Self { mcc_risk }
     }
 
+    // https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/REGRAS_DE_DETECCAO.md#as-14-dimens%C3%B5es-do-vetor
     pub fn vectorize(&self, payload: &TransactionPayload) -> [f32; 14] {
         let tx = &payload.transaction;
         let customer = &payload.customer;
         let merchant = &payload.merchant;
         let terminal = &payload.terminal;
 
-        let hour = tx.requested_at.hour() as f32;
-        // chrono: num_days_from_monday() → Mon=0 .. Sun=6
-        let dow = tx.requested_at.weekday().num_days_from_monday() as f32;
+        let hour = tx.requested_at.hour() as usize;
+        let dow = tx.requested_at.weekday().num_days_from_monday() as usize;
 
         let (minutes_since_last, km_from_last) = match &payload.last_transaction {
             Some(last) => {
@@ -48,39 +61,46 @@ impl Vectorizer {
             None => (-1.0, -1.0),
         };
 
-        let unknown_merchant = if customer.known_merchants.contains(&merchant.id) {
+        let unknown_merchant = if customer.known_merchants.iter().any(|m| m == &merchant.id) {
             0.0
         } else {
             1.0
         };
 
-        let mcc_risk = *self.mcc_risk.get(&merchant.mcc).unwrap_or(&DEFAULT_MCC_RISK);
+        let mcc_risk = *self
+            .mcc_risk
+            .get(&merchant.mcc)
+            .unwrap_or(&DEFAULT_MCC_RISK);
 
         [
-            clamp01(tx.amount / MAX_AMOUNT),                                  // 0  amount
-            clamp01(tx.installments as f32 / MAX_INSTALLMENTS),               // 1  installments
-            clamp01((tx.amount / customer.avg_amount) / AMOUNT_VS_AVG_RATIO), // 2  amount_vs_avg
-            hour / MAX_HOUR,                                                   // 3  hour_of_day
-            dow / MAX_DOW,                                                     // 4  day_of_week
-            minutes_since_last,                                                // 5  minutes_since_last_tx
-            km_from_last,                                                      // 6  km_from_last_tx
-            clamp01(terminal.km_from_home / MAX_KM),                          // 7  km_from_home
-            clamp01(customer.tx_count_24h as f32 / MAX_TX_COUNT_24H),         // 8  tx_count_24h
-            if terminal.is_online { 1.0 } else { 0.0 },                       // 9  is_online
-            if terminal.card_present { 1.0 } else { 0.0 },                    // 10 card_present
-            unknown_merchant,                                                   // 11 unknown_merchant
-            mcc_risk,                                                           // 12 mcc_risk
-            clamp01(merchant.avg_amount / MAX_MERCHANT_AVG_AMOUNT),            // 13 merchant_avg_amount
+            clamp01(tx.amount / MAX_AMOUNT),
+            clamp01(tx.installments as f32 / MAX_INSTALLMENTS),
+            clamp01((tx.amount / customer.avg_amount) / AMOUNT_VS_AVG_RATIO),
+            HOUR_LUT[hour],
+            DOW_LUT[dow],
+            minutes_since_last,
+            km_from_last,
+            clamp01(terminal.km_from_home / MAX_KM),
+            clamp01(customer.tx_count_24h as f32 / MAX_TX_COUNT_24H),
+            if terminal.is_online { 1.0 } else { 0.0 },
+            if terminal.card_present { 1.0 } else { 0.0 },
+            unknown_merchant,
+            mcc_risk,
+            clamp01(merchant.avg_amount / MAX_MERCHANT_AVG_AMOUNT),
         ]
     }
 
-    /// Quantize a float vector to i8.
-    /// Range [0.0, 1.0] maps to [0, 127].
-    /// Sentinel -1.0 maps to -127 naturally: (-1.0 * 127.0).round() = -127.
-    pub fn quantize(vector: &[f32; 14]) -> [i8; 14] {
-        let mut out = [0i8; 14];
+    // Quantize: convert [f32; 14] to [i16; 14].
+    // Scale = 10_000.0: 1.0 → 10000, 0.0 → 0, -1.0 → -10000.
+    // Clamped to i16 range after scaling to prevent overflow from extreme inputs.
+    // This makes distance computation integer-only (i64 arithmetic in search.rs),
+    // avoiding float overhead and enabling SIMD (AVX2).
+    pub fn quantize(vector: &[f32; 14]) -> [i16; 14] {
+        let mut out = [0i16; 14];
         for (i, &v) in vector.iter().enumerate() {
-            out[i] = (v * 127.0).round().clamp(-127.0, 127.0) as i8;
+            out[i] = (v * 10_000.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         }
         out
     }
@@ -89,7 +109,9 @@ impl Vectorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Customer, LastTransaction, Merchant, Terminal, Transaction, TransactionPayload};
+    use crate::types::{
+        Customer, LastTransaction, Merchant, Terminal, Transaction, TransactionPayload,
+    };
 
     fn mcc_map(entries: &[(&str, f32)]) -> HashMap<String, f32> {
         entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -101,12 +123,12 @@ mod tests {
             transaction: Transaction {
                 amount: 500.0,
                 installments: 1,
-                requested_at: "2026-01-05T12:00:00Z".parse().unwrap(), // Monday noon
+                requested_at: "2026-01-05T12:00:00Z".parse().unwrap(),
             },
             customer: Customer {
                 avg_amount: 1000.0,
                 tx_count_24h: 2,
-                known_merchants: vec!["MERC-001".into()],
+                known_merchants: vec!["MERC-001".to_string()],
             },
             merchant: Merchant {
                 id: "MERC-001".into(),
@@ -125,8 +147,6 @@ mod tests {
     fn vec_for(payload: &TransactionPayload) -> [f32; 14] {
         Vectorizer::new(mcc_map(&[("5912", 0.20)])).vectorize(payload)
     }
-
-    // ── dim 0: amount ────────────────────────────────────────────────────────
 
     #[test]
     fn dim0_normal() {
@@ -149,8 +169,6 @@ mod tests {
         assert_eq!(vec_for(&p)[0], 0.0);
     }
 
-    // ── dim 1: installments ──────────────────────────────────────────────────
-
     #[test]
     fn dim1_normal() {
         let mut p = base_payload();
@@ -172,11 +190,8 @@ mod tests {
         assert_eq!(vec_for(&p)[1], 0.0);
     }
 
-    // ── dim 2: amount_vs_avg ─────────────────────────────────────────────────
-
     #[test]
     fn dim2_normal() {
-        // amount=500, avg=1000 → (0.5) / 10 = 0.05
         let mut p = base_payload();
         p.transaction.amount = 500.0;
         p.customer.avg_amount = 1000.0;
@@ -185,14 +200,11 @@ mod tests {
 
     #[test]
     fn dim2_clamped_above_max() {
-        // amount=10000, avg=100 → ratio=100 → /10 = 10 → clamped 1.0
         let mut p = base_payload();
         p.transaction.amount = 10_000.0;
         p.customer.avg_amount = 100.0;
         assert_eq!(vec_for(&p)[2], 1.0);
     }
-
-    // ── dim 3: hour_of_day ───────────────────────────────────────────────────
 
     #[test]
     fn dim3_midnight() {
@@ -215,11 +227,8 @@ mod tests {
         assert!((vec_for(&p)[3] - 12.0 / 23.0).abs() < 1e-5);
     }
 
-    // ── dim 4: day_of_week ───────────────────────────────────────────────────
-
     #[test]
     fn dim4_monday() {
-        // 2026-01-05 is Monday (Jan 1=Thu → +4 = Mon)
         let mut p = base_payload();
         p.transaction.requested_at = "2026-01-05T12:00:00Z".parse().unwrap();
         assert_eq!(vec_for(&p)[4], 0.0);
@@ -227,13 +236,10 @@ mod tests {
 
     #[test]
     fn dim4_sunday() {
-        // 2026-01-11 is Sunday
         let mut p = base_payload();
         p.transaction.requested_at = "2026-01-11T12:00:00Z".parse().unwrap();
         assert_eq!(vec_for(&p)[4], 1.0);
     }
-
-    // ── dim 5: minutes_since_last_tx ─────────────────────────────────────────
 
     #[test]
     fn dim5_sentinel_when_no_last_tx() {
@@ -243,7 +249,6 @@ mod tests {
 
     #[test]
     fn dim5_normal() {
-        // 720 minutes ago → 720/1440 = 0.5
         let mut p = base_payload();
         p.transaction.requested_at = "2026-01-05T12:00:00Z".parse().unwrap();
         p.last_transaction = Some(LastTransaction {
@@ -258,13 +263,11 @@ mod tests {
         let mut p = base_payload();
         p.transaction.requested_at = "2026-01-06T12:00:00Z".parse().unwrap();
         p.last_transaction = Some(LastTransaction {
-            timestamp: "2026-01-05T00:00:00Z".parse().unwrap(), // 36h ago
+            timestamp: "2026-01-05T00:00:00Z".parse().unwrap(),
             km_from_current: 0.0,
         });
         assert_eq!(vec_for(&p)[5], 1.0);
     }
-
-    // ── dim 6: km_from_last_tx ───────────────────────────────────────────────
 
     #[test]
     fn dim6_sentinel_when_no_last_tx() {
@@ -292,8 +295,6 @@ mod tests {
         assert_eq!(vec_for(&p)[6], 1.0);
     }
 
-    // ── dim 7: km_from_home ──────────────────────────────────────────────────
-
     #[test]
     fn dim7_normal() {
         let mut p = base_payload();
@@ -315,8 +316,6 @@ mod tests {
         assert_eq!(vec_for(&p)[7], 0.0);
     }
 
-    // ── dim 8: tx_count_24h ──────────────────────────────────────────────────
-
     #[test]
     fn dim8_normal() {
         let mut p = base_payload();
@@ -330,8 +329,6 @@ mod tests {
         p.customer.tx_count_24h = 40;
         assert_eq!(vec_for(&p)[8], 1.0);
     }
-
-    // ── dim 9: is_online ─────────────────────────────────────────────────────
 
     #[test]
     fn dim9_online() {
@@ -347,8 +344,6 @@ mod tests {
         assert_eq!(vec_for(&p)[9], 0.0);
     }
 
-    // ── dim 10: card_present ─────────────────────────────────────────────────
-
     #[test]
     fn dim10_present() {
         let mut p = base_payload();
@@ -363,13 +358,11 @@ mod tests {
         assert_eq!(vec_for(&p)[10], 0.0);
     }
 
-    // ── dim 11: unknown_merchant ─────────────────────────────────────────────
-
     #[test]
     fn dim11_known_merchant() {
         let mut p = base_payload();
         p.merchant.id = "MERC-001".into();
-        p.customer.known_merchants = vec!["MERC-001".into()];
+        p.customer.known_merchants = vec!["MERC-001".to_string()];
         assert_eq!(vec_for(&p)[11], 0.0);
     }
 
@@ -377,11 +370,9 @@ mod tests {
     fn dim11_unknown_merchant() {
         let mut p = base_payload();
         p.merchant.id = "MERC-999".into();
-        p.customer.known_merchants = vec!["MERC-001".into()];
+        p.customer.known_merchants = vec!["MERC-001".to_string()];
         assert_eq!(vec_for(&p)[11], 1.0);
     }
-
-    // ── dim 12: mcc_risk ─────────────────────────────────────────────────────
 
     #[test]
     fn dim12_known_mcc() {
@@ -397,8 +388,6 @@ mod tests {
         assert!((vec_for(&p)[12] - 0.5).abs() < 1e-5);
     }
 
-    // ── dim 13: merchant_avg_amount ──────────────────────────────────────────
-
     #[test]
     fn dim13_normal() {
         let mut p = base_payload();
@@ -413,18 +402,16 @@ mod tests {
         assert_eq!(vec_for(&p)[13], 1.0);
     }
 
-    // ── quantize ─────────────────────────────────────────────────────────────
-
     #[test]
     fn quantize_zero() {
         let v = [0.0f32; 14];
-        assert_eq!(Vectorizer::quantize(&v), [0i8; 14]);
+        assert_eq!(Vectorizer::quantize(&v), [0i16; 14]);
     }
 
     #[test]
     fn quantize_one() {
         let v = [1.0f32; 14];
-        assert_eq!(Vectorizer::quantize(&v), [127i8; 14]);
+        assert_eq!(Vectorizer::quantize(&v), [10_000i16; 14]);
     }
 
     #[test]
@@ -433,7 +420,7 @@ mod tests {
         v[5] = -1.0;
         v[6] = -1.0;
         let q = Vectorizer::quantize(&v);
-        assert_eq!(q[5], -127);
-        assert_eq!(q[6], -127);
+        assert_eq!(q[5], -10_000);
+        assert_eq!(q[6], -10_000);
     }
 }
