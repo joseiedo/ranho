@@ -798,6 +798,7 @@ name = "preprocessor"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "rayon",
  "serde",
  "serde_json",
 ]
