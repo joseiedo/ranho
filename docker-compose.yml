@@ -19,7 +19,7 @@ services:
       - rinha
 
   api1:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.1
     environment:
       INDEX_PATH: /app/resources/index.bin
       MCC_RISK_PATH: /app/resources/mcc_risk.json
@@ -37,7 +37,7 @@ services:
       - rinha
 
   api2:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.1
     environment:
       INDEX_PATH: /app/resources/index.bin
       MCC_RISK_PATH: /app/resources/mcc_risk.json
