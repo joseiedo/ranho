@@ -20,7 +20,7 @@ services:
 
   api1:
     build: .
-    image: rinha-2026:local  # for submission, replace with: ghcr.io/iedo/rinha-2026:latest
+    image: rinha-2026:local  # for submission, replace with: ghcr.io/joseiedo/rinha-de-backend-2026:latest
     environment:
       INDEX_PATH: /app/resources/index.bin
       MCC_RISK_PATH: /app/resources/mcc_risk.json
@@ -39,7 +39,7 @@ services:
 
   api2:
     build: .
-    image: rinha-2026:local  # for submission, replace with: ghcr.io/iedo/rinha-2026:latest
+    image: rinha-2026:local  # for submission, replace with: ghcr.io/joseiedo/rinha-de-backend-2026:latest
     environment:
       INDEX_PATH: /app/resources/index.bin
       MCC_RISK_PATH: /app/resources/mcc_risk.json

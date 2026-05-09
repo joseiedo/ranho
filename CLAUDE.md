@@ -39,7 +39,7 @@ docker compose up -d
 # ── Docker (submission — linux/amd64 + Haswell AVX2) ──────────────────────
 docker buildx build --platform linux/amd64 \
   --build-arg API_RUSTFLAGS="-C target-cpu=haswell" \
-  -t ghcr.io/iedo/rinha-2026:latest --push .
+  -t ghcr.io/joseiedo/rinha-de-backend-2026:latest --push .
 
 # On the submission branch: replace docker-compose.yml with docker-compose.submission.yml
 # git checkout submission
