@@ -23,7 +23,7 @@ fn bench_single_query(c: &mut Criterion) {
 
     c.bench_function("search_3m_single_query", |b| {
         b.iter(|| {
-            let _ = idx.search(std::hint::black_box(&query));
+            let _ = idx.search(std::hint::black_box(&query)).0;
         });
     });
 }

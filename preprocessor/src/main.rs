@@ -65,8 +65,6 @@ fn main() {
     let k_actual = K.min(n);
     eprintln!("preprocessor: running k-means (K={k_actual}, iters={KMEANS_ITERS})...");
 
-    // Initialise centroids: evenly-spaced sample from the data so every cluster
-    // starts with at least one vector and the initial partition is spread out.
     let mut centroids: Vec<[f32; DIMS]> = (0..k_actual)
         .map(|i| vectors[i * (n / k_actual)])
         .collect();
@@ -75,7 +73,6 @@ fn main() {
     let mut counts = vec![0u32; k_actual];
 
     for iter in 0..KMEANS_ITERS {
-        // Assignment step — parallel over vectors.
         let new_assignments: Vec<u32> = vectors
             .par_iter()
             .map(|v| {
@@ -99,7 +96,6 @@ fn main() {
             .count();
         assignments = new_assignments;
 
-        // Update step — recompute centroids as mean of assigned vectors.
         let mut sums = vec![[0.0f32; DIMS]; k_actual];
         counts.fill(0);
         for (i, &c) in assignments.iter().enumerate() {
@@ -116,8 +112,6 @@ fn main() {
                     centroids[ci][d] = sums[ci][d] / cnt;
                 }
             }
-            // If count == 0 the centroid stays where it is; it will never be
-            // nearest and its cluster will appear empty in the offsets table.
         }
 
         eprintln!(
@@ -131,16 +125,14 @@ fn main() {
 
     eprintln!("preprocessor: sorting vectors by cluster...");
 
-    // Build cluster start offsets from the counts array (exclusive prefix sum).
     let mut cluster_starts = vec![0u32; k_actual + 1];
     let mut running: u32 = 0;
     for ci in 0..k_actual {
         cluster_starts[ci] = running;
         running += counts[ci];
     }
-    cluster_starts[k_actual] = running; // == n
+    cluster_starts[k_actual] = running;
 
-    // Sort vector indices by cluster assignment.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| assignments[i]);
 
