@@ -8,7 +8,11 @@ use axum::{
     Json, Router,
 };
 use bytes::Bytes;
-use std::{collections::HashMap, sync::Arc};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use tower_service::Service;
 
 struct AppState {
     vectorizer: Vectorizer,
@@ -41,6 +45,13 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> Json<Fr
     let (fraud_score, approved) = api::scorer::score(neighbors);
 
     Json(FraudResponse { approved, fraud_score })
+}
+
+fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) => match e {},
+    }
 }
 
 #[tokio::main]
@@ -77,8 +88,39 @@ async fn main() {
         .route("/fraud-score", post(fraud_score))
         .with_state(state);
 
-    let addr = "0.0.0.0:9999";
-    eprintln!("listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // Default to /tmp for local dev; docker-compose sets the real path per instance.
+    let socket_path = std::env::var("SOCKET_PATH")
+        .unwrap_or_else(|_| "/tmp/api.sock".to_string());
+
+    // Remove stale socket and ensure the parent directory exists.
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    eprintln!("listening on unix:{socket_path}");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    // Allow nginx (different user) to connect: unix socket connect requires write permission.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777)).ok();
+    }
+    let mut make_service = app.into_make_service();
+
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
+        // IntoMakeService is always ready — no poll_ready needed.
+        let svc: axum::Router = unwrap_infallible(make_service.call(()).await);
+
+        tokio::spawn(async move {
+            let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                svc.clone().call(req)
+            });
+            Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(socket), hyper_svc)
+                .await
+                .ok();
+        });
+    }
 }

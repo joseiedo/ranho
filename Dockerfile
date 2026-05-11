@@ -45,5 +45,4 @@ COPY resources/mcc_risk.json                    ./resources/
 ENV INDEX_PATH=/app/resources/index.bin
 ENV MCC_RISK_PATH=/app/resources/mcc_risk.json
 
-EXPOSE 9999
 CMD ["./api"]

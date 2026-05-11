@@ -11,6 +11,9 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
 memmap2 = "0.9"
+hyper = { version = "1", features = ["http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+tower-service = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

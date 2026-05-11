@@ -73,4 +73,4 @@ POST /fraud-score → parse JSON → vectorizer → quantize → search → scor
 - The vectorizer is dependency-injected with the MCC risk map (`HashMap<String, f32>`) making it straightforward to test without touching the filesystem.
 - Production build requires `RUSTFLAGS="-C target-cpu=haswell"` for AVX2 auto-vectorization in the search loop (the test machine is a Mac Mini Late 2014, Haswell).
 
-**Resource budget (docker-compose):** 1.0 CPU + 350 MB RAM total across nginx (0.1 CPU / 30 MB) + 2× API instances (0.45 CPU / 155 MB each).
+**Resource budget (docker-compose):** 1.0 CPU + 350 MB RAM total across nginx (0.2 CPU / 30 MB) + 2× API instances (0.40 CPU / 155 MB each).

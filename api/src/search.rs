@@ -1,6 +1,6 @@
 use crate::types::Label;
 use memmap2::Mmap;
-use std::collections::BinaryHeap;
+use std::cell::RefCell;
 use std::fs::File;
 
 const IVF_MAGIC: &[u8; 8] = b"RINHIVF1";
@@ -116,34 +116,40 @@ impl SearchIndex {
         let data = &self.mmap[self.data_byte..];
 
         // Phase 1: dequantize query and find the top-NPROBE closest centroids.
-        // For non-negative finite f32, to_bits() preserves ordering — safe to sort as u32.
+        // Reuse a thread-local Vec to avoid per-query heap allocation.
         let mut query_f32 = [0.0f32; DIMS];
         for d in 0..DIMS {
             query_f32[d] = query[d] as f32 / 127.0;
         }
 
         let nprobe = NPROBE.min(self.k_clusters);
-        let mut centroid_dists: Vec<(u32, usize)> = self
-            .centroids
-            .iter()
-            .enumerate()
-            .map(|(ci, c)| {
+        // Stack-allocate the probed cluster indices to avoid borrow across closure boundary.
+        let mut probed = [0usize; NPROBE];
+
+        CENTROID_BUF.with_borrow_mut(|buf| {
+            buf.clear();
+            buf.extend(self.centroids.iter().enumerate().map(|(ci, c)| {
                 let mut d = 0.0f32;
                 for i in 0..DIMS {
                     let diff = query_f32[i] - c[i];
                     d += diff * diff;
                 }
                 (d.to_bits(), ci)
-            })
-            .collect();
-        // Partial sort: bring the nprobe smallest to the front.
-        centroid_dists.select_nth_unstable(nprobe - 1);
-        let probed = &centroid_dists[..nprobe];
+            }));
+            buf.select_nth_unstable(nprobe - 1);
+            for (slot, &(_, ci)) in probed.iter_mut().zip(buf[..nprobe].iter()) {
+                *slot = ci;
+            }
+        });
 
-        // Phase 2: scan each probed cluster with the full sentinel-aware dist_scalar.
-        let mut heap: BinaryHeap<(i32, u8)> = BinaryHeap::with_capacity(K + 1);
+        // Phase 2: scan each probed cluster. Use a fixed-size array instead of
+        // BinaryHeap to avoid heap allocation for this tiny K=5 collection.
+        let mut top = [(i32::MAX, 0u8); K];
+        let mut top_len = 0usize;
+        let mut worst_dist = i32::MAX;
+        let mut worst_pos = 0usize;
 
-        for &(_, ci) in probed {
+        for &ci in &probed[..nprobe] {
             let start = u32::from_le_bytes(
                 offsets[ci * 4..ci * 4 + 4].try_into().unwrap(),
             ) as usize;
@@ -155,19 +161,34 @@ impl SearchIndex {
                 let base = j * (DIMS + 1);
                 let dist = dist_scalar(query, &data[base..base + DIMS]);
 
-                if heap.len() < K {
-                    heap.push((dist, data[base + DIMS]));
-                } else if let Some(&(max_d, _)) = heap.peek() {
-                    if dist < max_d {
-                        heap.pop();
-                        heap.push((dist, data[base + DIMS]));
+                if top_len < K {
+                    top[top_len] = (dist, data[base + DIMS]);
+                    top_len += 1;
+                    if top_len == K {
+                        // First time full: find the worst slot.
+                        worst_pos = 0;
+                        for i in 1..K {
+                            if top[i].0 > top[worst_pos].0 {
+                                worst_pos = i;
+                            }
+                        }
+                        worst_dist = top[worst_pos].0;
                     }
+                } else if dist < worst_dist {
+                    top[worst_pos] = (dist, data[base + DIMS]);
+                    worst_pos = 0;
+                    for i in 1..K {
+                        if top[i].0 > top[worst_pos].0 {
+                            worst_pos = i;
+                        }
+                    }
+                    worst_dist = top[worst_pos].0;
                 }
             }
         }
 
         let mut result = [Label::Legit; K];
-        for (slot, (_, label_byte)) in result.iter_mut().zip(heap.into_iter()) {
+        for (slot, &(_, label_byte)) in result.iter_mut().zip(top[..top_len].iter()) {
             if label_byte == 1 {
                 *slot = Label::Fraud;
             }
@@ -176,23 +197,34 @@ impl SearchIndex {
     }
 }
 
-#[inline]
+thread_local! {
+    static CENTROID_BUF: RefCell<Vec<(u32, usize)>> = RefCell::new(Vec::with_capacity(2048));
+}
+
+#[inline(always)]
 fn dist_scalar(query: &[i8; DIMS], record: &[u8]) -> i32 {
+    // Dims 0–4 and 7–13: branch-free squared diff — auto-vectorized by AVX2/NEON.
     let mut dist: i32 = 0;
-    for d in 0..DIMS {
+    for d in 0..5 {
+        let diff = query[d] as i32 - (record[d] as i8) as i32;
+        dist += diff * diff;
+    }
+    for d in 7..DIMS {
+        let diff = query[d] as i32 - (record[d] as i8) as i32;
+        dist += diff * diff;
+    }
+    // Dims 5–6: sentinel-aware (handled separately to keep the loops above branch-free).
+    for d in 5..7 {
         let q = query[d];
         let r = record[d] as i8;
-        let contribution = if (d == 5 || d == 6) && (q == SENTINEL || r == SENTINEL) {
-            if q == SENTINEL && r == SENTINEL {
-                0
-            } else {
-                SENTINEL_PENALTY
+        dist += match (q == SENTINEL, r == SENTINEL) {
+            (true, true) => 0,
+            (true, false) | (false, true) => SENTINEL_PENALTY,
+            (false, false) => {
+                let diff = q as i32 - r as i32;
+                diff * diff
             }
-        } else {
-            let diff = q as i16 - r as i16;
-            (diff * diff) as i32
         };
-        dist += contribution;
     }
     dist
 }
