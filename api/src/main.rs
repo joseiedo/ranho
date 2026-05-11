@@ -233,7 +233,7 @@ fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
     }
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     let mcc_risk_path = std::env::var("MCC_RISK_PATH")
         .unwrap_or_else(|_| "./resources/mcc_risk.json".to_string());
