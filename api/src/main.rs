@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use api::search::SearchIndex;
 use api::types::FraudResponse;
 use api::vectorizer::Vectorizer;

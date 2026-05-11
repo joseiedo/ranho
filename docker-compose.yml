@@ -27,6 +27,8 @@ services:
       SOCKET_PATH: /run/sock/api1.sock
     volumes:
       - sock:/run/sock
+    ulimits:
+      nofile: 65535
     healthcheck:
       test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sock/api1.sock", "http://localhost/ready"]
       interval: 3s
@@ -48,6 +50,8 @@ services:
       SOCKET_PATH: /run/sock/api2.sock
     volumes:
       - sock:/run/sock
+    ulimits:
+      nofile: 65535
     healthcheck:
       test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sock/api2.sock", "http://localhost/ready"]
       interval: 3s

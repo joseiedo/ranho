@@ -9,8 +9,10 @@ const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 /// KNN k
 const K: usize = 5;
-/// Number of clusters to probe per query. Higher = more accurate, slower.
-const NPROBE: usize = 16;
+/// Clusters to probe on the fast path (clear-cut cases).
+const NPROBE_FAST: usize = 5;
+/// Clusters to probe when the fast result is on the boundary (fraud_count == 2 or 3).
+const NPROBE_FULL: usize = 16;
 const SENTINEL: i8 = -127;
 /// Max squared distance for one i8 dimension (254² = 64516).
 /// Applied when exactly one of query/reference carries the sentinel on dim 5 or 6.
@@ -22,8 +24,8 @@ pub struct SearchIndex {
     n: usize,
     /// Parsed centroids — avoids byte-parsing on every query.
     centroids: Vec<[f32; DIMS]>,
-    /// Byte offset into `mmap` where the (K+1) u32 cluster-start offsets begin.
-    offsets_byte: usize,
+    /// Pre-parsed cluster start offsets — avoids per-query mmap reads.
+    offsets: Vec<u32>,
     /// Byte offset into `mmap` where the flat N×15-byte record data begins.
     data_byte: usize,
 }
@@ -72,12 +74,19 @@ impl SearchIndex {
             centroids.push(c);
         }
 
+        // Pre-parse cluster offsets to avoid per-query mmap reads.
+        let mut offsets = Vec::with_capacity(k_clusters + 1);
+        for i in 0..=k_clusters {
+            let base = offsets_byte + i * 4;
+            offsets.push(u32::from_le_bytes(mmap[base..base + 4].try_into().unwrap()));
+        }
+
         Ok(Self {
             mmap,
             k_clusters,
             n,
             centroids,
-            offsets_byte,
+            offsets,
             data_byte,
         })
     }
@@ -89,10 +98,10 @@ impl SearchIndex {
     /// Touch mmap pages and run random queries to bring the index into page cache
     /// before real traffic arrives.
     pub fn warmup(&self) {
-        // Touch offsets and data regions sequentially so the OS pages them in.
+        // Touch offsets (already parsed) and data region.
         let mut sink: u64 = 0;
-        for b in self.mmap[self.offsets_byte..self.data_byte].iter() {
-            sink ^= *b as u64;
+        for &o in &self.offsets {
+            sink ^= o as u64;
         }
         // Sample every 64th byte of the data region (one per cache line) to fault
         // in all pages without reading every byte.
@@ -139,19 +148,17 @@ impl SearchIndex {
     }
 
     fn search_impl(&self, query: &[i8; DIMS]) -> [Label; K] {
-        let offsets = &self.mmap[self.offsets_byte..];
         let data = &self.mmap[self.data_byte..];
 
-        // Phase 1: dequantize query and find the top-NPROBE closest centroids.
-        // Reuse a thread-local Vec to avoid per-query heap allocation.
+        // Phase 1: dequantize query and find closest centroids (thread-local buf).
         let mut query_f32 = [0.0f32; DIMS];
         for d in 0..DIMS {
             query_f32[d] = query[d] as f32 / 127.0;
         }
 
-        let nprobe = NPROBE.min(self.k_clusters);
-        // Stack-allocate the probed cluster indices to avoid borrow across closure boundary.
-        let mut probed = [0usize; NPROBE];
+        let nprobe_fast = NPROBE_FAST.min(self.k_clusters);
+        let nprobe_full = NPROBE_FULL.min(self.k_clusters);
+        let mut probed = [0usize; NPROBE_FULL];
 
         CENTROID_BUF.with_borrow_mut(|buf| {
             buf.clear();
@@ -163,55 +170,28 @@ impl SearchIndex {
                 }
                 (d.to_bits(), ci)
             }));
-            buf.select_nth_unstable(nprobe - 1);
-            for (slot, &(_, ci)) in probed.iter_mut().zip(buf[..nprobe].iter()) {
+            buf.select_nth_unstable(nprobe_full - 1);
+            for (slot, &(_, ci)) in probed.iter_mut().zip(buf[..nprobe_full].iter()) {
                 *slot = ci;
             }
         });
 
-        // Phase 2: scan each probed cluster. Use a fixed-size array instead of
-        // BinaryHeap to avoid heap allocation for this tiny K=5 collection.
+        // Phase 2: fast scan (NPROBE_FAST clusters).
         let mut top = [(i32::MAX, 0u8); K];
         let mut top_len = 0usize;
         let mut worst_dist = i32::MAX;
         let mut worst_pos = 0usize;
 
-        for &ci in &probed[..nprobe] {
-            let start = u32::from_le_bytes(
-                offsets[ci * 4..ci * 4 + 4].try_into().unwrap(),
-            ) as usize;
-            let end = u32::from_le_bytes(
-                offsets[(ci + 1) * 4..(ci + 1) * 4 + 4].try_into().unwrap(),
-            ) as usize;
+        self.scan_clusters(query, data, &probed[..nprobe_fast],
+            &mut top, &mut top_len, &mut worst_dist, &mut worst_pos);
 
-            for j in start..end {
-                let base = j * (DIMS + 1);
-                let dist = dist_scalar(query, &data[base..base + DIMS]);
+        // Count fraud in fast result.
+        let fraud_fast = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
 
-                if top_len < K {
-                    top[top_len] = (dist, data[base + DIMS]);
-                    top_len += 1;
-                    if top_len == K {
-                        // First time full: find the worst slot.
-                        worst_pos = 0;
-                        for i in 1..K {
-                            if top[i].0 > top[worst_pos].0 {
-                                worst_pos = i;
-                            }
-                        }
-                        worst_dist = top[worst_pos].0;
-                    }
-                } else if dist < worst_dist {
-                    top[worst_pos] = (dist, data[base + DIMS]);
-                    worst_pos = 0;
-                    for i in 1..K {
-                        if top[i].0 > top[worst_pos].0 {
-                            worst_pos = i;
-                        }
-                    }
-                    worst_dist = top[worst_pos].0;
-                }
-            }
+        // Adaptive: only run full probe if result is on the approval boundary.
+        if top_len == K && (fraud_fast == 2 || fraud_fast == 3) {
+            self.scan_clusters(query, data, &probed[nprobe_fast..nprobe_full],
+                &mut top, &mut top_len, &mut worst_dist, &mut worst_pos);
         }
 
         let mut result = [Label::Legit; K];
@@ -221,6 +201,50 @@ impl SearchIndex {
             }
         }
         result
+    }
+
+    fn scan_clusters(
+        &self,
+        query: &[i8; DIMS],
+        data: &[u8],
+        clusters: &[usize],
+        top: &mut [(i32, u8); K],
+        top_len: &mut usize,
+        worst_dist: &mut i32,
+        worst_pos: &mut usize,
+    ) {
+        for &ci in clusters {
+            let start = self.offsets[ci] as usize;
+            let end = self.offsets[ci + 1] as usize;
+
+            for j in start..end {
+                let base = j * (DIMS + 1);
+                let dist = dist_scalar(query, &data[base..base + DIMS]);
+
+                if *top_len < K {
+                    top[*top_len] = (dist, data[base + DIMS]);
+                    *top_len += 1;
+                    if *top_len == K {
+                        *worst_pos = 0;
+                        for i in 1..K {
+                            if top[i].0 > top[*worst_pos].0 {
+                                *worst_pos = i;
+                            }
+                        }
+                        *worst_dist = top[*worst_pos].0;
+                    }
+                } else if dist < *worst_dist {
+                    top[*worst_pos] = (dist, data[base + DIMS]);
+                    *worst_pos = 0;
+                    for i in 1..K {
+                        if top[i].0 > top[*worst_pos].0 {
+                            *worst_pos = i;
+                        }
+                    }
+                    *worst_dist = top[*worst_pos].0;
+                }
+            }
+        }
     }
 }
 
