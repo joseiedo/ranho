@@ -13,7 +13,7 @@ const K: usize = 5;
 /// Clusters to probe on the fast path (clear-cut cases).
 const NPROBE_FAST: usize = 5;
 /// Clusters to probe when the fast result is on the boundary (fraud_count == 2 or 3).
-const NPROBE_FULL: usize = 16;
+const NPROBE_FULL: usize = 8;
 const SENTINEL: i8 = -127;
 /// Max squared distance for one i8 dimension (254² = 64516).
 /// Applied when exactly one of query/reference carries the sentinel on dim 5 or 6.
