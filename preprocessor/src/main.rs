@@ -14,7 +14,7 @@ use std::io::{BufWriter, Write};
 ///   [.. ..]              flat data: N × ([i8; 14] quantized + u8 label), sorted by cluster
 pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF1";
 const DIMS: usize = 14;
-const K: usize = 1024;
+const K: usize = 2048;
 const KMEANS_ITERS: usize = 25;
 
 #[derive(Deserialize)]
