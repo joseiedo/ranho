@@ -70,6 +70,9 @@ async fn main() {
     let index = match SearchIndex::open(&index_path) {
         Ok(idx) => {
             eprintln!("index loaded: {} vectors", idx.count());
+            eprintln!("warming up...");
+            idx.warmup();
+            eprintln!("warm");
             Some(idx)
         }
         Err(e) => {

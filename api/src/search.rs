@@ -86,6 +86,33 @@ impl SearchIndex {
         self.n
     }
 
+    /// Touch mmap pages and run random queries to bring the index into page cache
+    /// before real traffic arrives.
+    pub fn warmup(&self) {
+        // Touch offsets and data regions sequentially so the OS pages them in.
+        let mut sink: u64 = 0;
+        for b in self.mmap[self.offsets_byte..self.data_byte].iter() {
+            sink ^= *b as u64;
+        }
+        // Sample every 64th byte of the data region (one per cache line) to fault
+        // in all pages without reading every byte.
+        for b in self.mmap[self.data_byte..].iter().step_by(64) {
+            sink ^= *b as u64;
+        }
+        let _ = sink;
+
+        // Run 500 random queries to warm up the search code paths and TLB.
+        let mut state = 0x12345678u32;
+        for _ in 0..500 {
+            let mut q = [0i8; DIMS];
+            for v in q.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = (state >> 24) as i8;
+            }
+            let _ = self.search(&q);
+        }
+    }
+
     pub fn search(&self, query: &[i8; DIMS]) -> [Label; K] {
         #[cfg(target_arch = "x86_64")]
         // SAFETY: AVX2 is guaranteed by RUSTFLAGS="-C target-cpu=haswell".
