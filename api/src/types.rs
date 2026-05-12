@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 #[derive(Debug, Deserialize)]
 pub struct TransactionPayload {
+    #[serde(skip)]
     pub id: String,
     pub transaction: Transaction,
     pub customer: Customer,
@@ -23,7 +23,7 @@ pub struct Transaction {
 pub struct Customer {
     pub avg_amount: f32,
     pub tx_count_24h: u32,
-    pub known_merchants: HashSet<String>,
+    pub known_merchants: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

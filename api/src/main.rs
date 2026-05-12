@@ -260,8 +260,31 @@ async fn main() {
         }
     };
 
+    let vectorizer = Vectorizer::new(mcc_risk);
+
+    // Warm up the full request pipeline: JSON parse → vectorize → quantize → search.
+    // Primes serde_json internals, branch predictor, and the vectorizer code path
+    // before the first real request arrives.
+    if let Some(idx) = &index {
+        const WARMUP_PAYLOAD: &[u8] = br#"{
+            "id": "warmup",
+            "transaction": {"amount": 250.0, "installments": 1, "requested_at": "2026-01-05T12:00:00Z"},
+            "customer": {"avg_amount": 500.0, "tx_count_24h": 3, "known_merchants": ["MERC-001"]},
+            "merchant": {"id": "MERC-001", "mcc": "5912", "avg_amount": 300.0},
+            "terminal": {"is_online": false, "card_present": true, "km_from_home": 5.0},
+            "last_transaction": {"timestamp": "2026-01-05T10:00:00Z", "km_from_current": 2.0}
+        }"#;
+        for _ in 0..500 {
+            if let Ok(payload) = serde_json::from_slice::<api::types::TransactionPayload>(WARMUP_PAYLOAD) {
+                let vector = vectorizer.vectorize(&payload);
+                let quantized = Vectorizer::quantize(&vector);
+                let _ = idx.search(&quantized);
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
-        vectorizer: Vectorizer::new(mcc_risk),
+        vectorizer,
         index,
         metrics: Metrics::default(),
     });

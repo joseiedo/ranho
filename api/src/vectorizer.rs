@@ -48,7 +48,7 @@ impl Vectorizer {
             None => (-1.0, -1.0),
         };
 
-        let unknown_merchant = if customer.known_merchants.contains(&merchant.id) {
+        let unknown_merchant = if customer.known_merchants.iter().any(|m| m == &merchant.id) {
             0.0
         } else {
             1.0
@@ -106,7 +106,7 @@ mod tests {
             customer: Customer {
                 avg_amount: 1000.0,
                 tx_count_24h: 2,
-                known_merchants: std::collections::HashSet::from(["MERC-001".to_string()]),
+                known_merchants: vec!["MERC-001".to_string()],
             },
             merchant: Merchant {
                 id: "MERC-001".into(),
@@ -369,7 +369,7 @@ mod tests {
     fn dim11_known_merchant() {
         let mut p = base_payload();
         p.merchant.id = "MERC-001".into();
-        p.customer.known_merchants = std::collections::HashSet::from(["MERC-001".to_string()]);
+        p.customer.known_merchants = vec!["MERC-001".to_string()];
         assert_eq!(vec_for(&p)[11], 0.0);
     }
 
@@ -377,7 +377,7 @@ mod tests {
     fn dim11_unknown_merchant() {
         let mut p = base_payload();
         p.merchant.id = "MERC-999".into();
-        p.customer.known_merchants = std::collections::HashSet::from(["MERC-001".to_string()]);
+        p.customer.known_merchants = vec!["MERC-001".to_string()];
         assert_eq!(vec_for(&p)[11], 1.0);
     }
 
