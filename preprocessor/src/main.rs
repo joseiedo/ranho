@@ -12,7 +12,7 @@ use std::io::{BufWriter, Write};
 ///   [20 .. 20+K*56]      centroids: K × [f32; 14], row-major, le
 ///   [.. .. +K*56+(K+1)*4] offsets: (K+1) × u32 le — record index of each cluster start
 ///   [.. ..]              flat data: N × ([i8; 14] quantized + u8 label), sorted by cluster
-pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF1";
+pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF2";
 const DIMS: usize = 14;
 const K: usize = 2048;
 const KMEANS_ITERS: usize = 25;
@@ -159,18 +159,23 @@ fn main() {
         writer.write_all(&o.to_le_bytes()).unwrap();
     }
 
-    // Flat data in cluster order: each record is [i8; DIMS] + u8 label (15 bytes)
+    // Vectors in cluster order: N × [i8; 14] + [0u8; 2] padding = 16 bytes each
     for &idx in &order {
         for &v in &vectors[idx] {
             writer.write_all(&[quantize(v) as u8]).unwrap();
         }
+        writer.write_all(&[0u8, 0u8]).unwrap();
+    }
+
+    // Labels in cluster order: N × u8
+    for &idx in &order {
         writer.write_all(&[labels[idx]]).unwrap();
     }
 
     writer.flush().unwrap();
 
     let file_size =
-        20 + k_actual * DIMS * 4 + (k_actual + 1) * 4 + n * (DIMS + 1);
+        20 + k_actual * DIMS * 4 + (k_actual + 1) * 4 + n * 16 + n;
     eprintln!(
         "preprocessor: wrote {output_path} ({file_size} bytes, IVF K={k_actual})"
     );

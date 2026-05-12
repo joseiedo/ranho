@@ -10,9 +10,21 @@ const MAX_MINUTES: f32 = 1440.0;
 const MAX_KM: f32 = 1000.0;
 const MAX_TX_COUNT_24H: f32 = 20.0;
 const MAX_MERCHANT_AVG_AMOUNT: f32 = 10_000.0;
-const MAX_HOUR: f32 = 23.0;
-const MAX_DOW: f32 = 6.0;
 const DEFAULT_MCC_RISK: f32 = 0.5;
+
+const HOUR_LUT: [f32; 24] = [
+    0.0 / 23.0,  1.0 / 23.0,  2.0 / 23.0,  3.0 / 23.0,
+    4.0 / 23.0,  5.0 / 23.0,  6.0 / 23.0,  7.0 / 23.0,
+    8.0 / 23.0,  9.0 / 23.0, 10.0 / 23.0, 11.0 / 23.0,
+   12.0 / 23.0, 13.0 / 23.0, 14.0 / 23.0, 15.0 / 23.0,
+   16.0 / 23.0, 17.0 / 23.0, 18.0 / 23.0, 19.0 / 23.0,
+   20.0 / 23.0, 21.0 / 23.0, 22.0 / 23.0, 23.0 / 23.0,
+];
+
+const DOW_LUT: [f32; 7] = [
+    0.0 / 6.0, 1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0,
+    4.0 / 6.0, 5.0 / 6.0, 6.0 / 6.0,
+];
 
 fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
@@ -33,9 +45,8 @@ impl Vectorizer {
         let merchant = &payload.merchant;
         let terminal = &payload.terminal;
 
-        let hour = tx.requested_at.hour() as f32;
-        // chrono: num_days_from_monday() → Mon=0 .. Sun=6
-        let dow = tx.requested_at.weekday().num_days_from_monday() as f32;
+        let hour = tx.requested_at.hour() as usize;
+        let dow = tx.requested_at.weekday().num_days_from_monday() as usize;
 
         let (minutes_since_last, km_from_last) = match &payload.last_transaction {
             Some(last) => {
@@ -60,8 +71,8 @@ impl Vectorizer {
             clamp01(tx.amount / MAX_AMOUNT),                                  // 0  amount
             clamp01(tx.installments as f32 / MAX_INSTALLMENTS),               // 1  installments
             clamp01((tx.amount / customer.avg_amount) / AMOUNT_VS_AVG_RATIO), // 2  amount_vs_avg
-            hour / MAX_HOUR,                                                   // 3  hour_of_day
-            dow / MAX_DOW,                                                     // 4  day_of_week
+            HOUR_LUT[hour],                                                    // 3  hour_of_day
+            DOW_LUT[dow],                                                      // 4  day_of_week
             minutes_since_last,                                                // 5  minutes_since_last_tx
             km_from_last,                                                      // 6  km_from_last_tx
             clamp01(terminal.km_from_home / MAX_KM),                          // 7  km_from_home

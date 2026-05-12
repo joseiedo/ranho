@@ -79,7 +79,7 @@ fn full_pipeline_failure_rate_under_5pct() {
 
         let vector = vectorizer.vectorize(&payload);
         let quantized = Vectorizer::quantize(&vector);
-        let (neighbors, _) = index.search(&quantized);
+        let neighbors = index.search(&quantized);
         let (fraud_score, approved) = score(neighbors);
 
         let is_failure = approved != entry.expected_approved
