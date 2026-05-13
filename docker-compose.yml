@@ -24,7 +24,7 @@ services:
       INDEX_PATH: /app/index.bin
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: "16"
+      NPROBE: "32"
       WARMUP_COUNT: "200"
     volumes:
       - sock:/run/sock
@@ -45,7 +45,7 @@ services:
       INDEX_PATH: /app/index.bin
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: "16"
+      NPROBE: "32"
       WARMUP_COUNT: "200"
     volumes:
       - sock:/run/sock
