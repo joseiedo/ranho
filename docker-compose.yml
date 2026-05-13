@@ -25,7 +25,7 @@ services:
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api1.sock
       NPROBE: "32"
-      WARMUP_COUNT: "200"
+      WARMUP_COUNT: "2000"
     volumes:
       - sock:/run/sock
     ulimits:
@@ -46,7 +46,7 @@ services:
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api2.sock
       NPROBE: "32"
-      WARMUP_COUNT: "200"
+      WARMUP_COUNT: "2000"
     volumes:
       - sock:/run/sock
     ulimits:
