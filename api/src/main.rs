@@ -78,20 +78,23 @@ async fn main() {
     let mcc_risk_path =
         std::env::var("MCC_RISK_PATH").unwrap_or_else(|_| "./resources/mcc_risk.json".to_string());
 
+    eprintln!("loading mcc_risk from {mcc_risk_path}");
     let mcc_risk: HashMap<String, f32> = std::fs::read_to_string(&mcc_risk_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    eprintln!("mcc_risk loaded: {} entries", mcc_risk.len());
 
     let index_path =
         std::env::var("INDEX_PATH").unwrap_or_else(|_| "./resources/index.bin".to_string());
 
+    eprintln!("loading index from {index_path}");
     let index = match SearchIndex::open(&index_path) {
         Ok(idx) => {
             eprintln!("index loaded: {} vectors", idx.count());
             eprintln!("warming up...");
             idx.warmup();
-            eprintln!("warm");
+            eprintln!("warmup done");
             Some(idx)
         }
         Err(e) => {
@@ -111,18 +114,19 @@ async fn main() {
 
     let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
 
+    eprintln!("opening socket at {socket_path}");
     let _ = std::fs::remove_file(&socket_path);
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    eprintln!("listening on unix:{socket_path}");
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777)).ok();
     }
+    eprintln!("listening on unix:{socket_path}");
     let mut make_service = app.into_make_service();
 
     loop {
