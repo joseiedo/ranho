@@ -2,15 +2,13 @@ use crate::types::Label;
 use memmap2::Mmap;
 use std::fs::File;
 
-const IVF_MAGIC: &[u8; 8] = b"RINHIVF2";
+const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
 const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
-const STRIDE: usize = 16;
+const STRIDE: usize = 32;
 const K: usize = 5;
 const NPROBE_FAST: usize = 8;
 const NPROBE_SLOW: usize = 48;
-const SENTINEL: i8 = -127;
-const SENTINEL_PENALTY: i32 = 64516;
 
 pub struct SearchIndex {
     mmap: Mmap,
@@ -99,16 +97,16 @@ impl SearchIndex {
 
         let mut state = 0x12345678u32;
         for _ in 0..500 {
-            let mut q = [0i8; DIMS];
+            let mut q = [0i16; DIMS];
             for v in q.iter_mut() {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                *v = (state >> 24) as i8;
+                *v = (((state >> 16) % 20_001) as i32 - 10_000) as i16;
             }
             let _ = self.search(&q);
         }
     }
 
-    pub fn search(&self, query: &[i8; DIMS]) -> [Label; K] {
+    pub fn search(&self, query: &[i16; DIMS]) -> [Label; K] {
         #[cfg(target_arch = "x86_64")]
         return unsafe { self.search_avx2(query) };
         #[cfg(target_arch = "aarch64")]
@@ -119,23 +117,23 @@ impl SearchIndex {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn search_avx2(&self, query: &[i8; DIMS]) -> [Label; K] {
+    unsafe fn search_avx2(&self, query: &[i16; DIMS]) -> [Label; K] {
         self.search_impl(query)
     }
 
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
-    unsafe fn search_neon(&self, query: &[i8; DIMS]) -> [Label; K] {
+    unsafe fn search_neon(&self, query: &[i16; DIMS]) -> [Label; K] {
         self.search_impl(query)
     }
 
-    fn search_impl(&self, query: &[i8; DIMS]) -> [Label; K] {
+    fn search_impl(&self, query: &[i16; DIMS]) -> [Label; K] {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
         let labels = &self.mmap[self.labels_byte..];
 
         let mut query_f32 = [0.0f32; DIMS];
         for d in 0..DIMS {
-            query_f32[d] = query[d] as f32 / 127.0;
+            query_f32[d] = query[d] as f32 / 10_000.0;
         }
 
         // Pre-compute top NPROBE_SLOW centroid distances in one pass.
@@ -167,9 +165,9 @@ impl SearchIndex {
             *slot = ci;
         }
 
-        let mut top = [(i32::MAX, 0u8); K];
+        let mut top = [(i64::MAX, 0u8); K];
         let mut top_len = 0usize;
-        let mut worst_dist = i32::MAX;
+        let mut worst_dist = i64::MAX;
         let mut worst_pos = 0usize;
 
         // ── Phase 1: fast probe ───────────────────────────────────────────────
@@ -209,13 +207,13 @@ impl SearchIndex {
 
     fn scan_clusters(
         &self,
-        query: &[i8; DIMS],
+        query: &[i16; DIMS],
         vectors: &[u8],
         labels: &[u8],
         clusters: &[usize],
-        top: &mut [(i32, u8); K],
+        top: &mut [(i64, u8); K],
         top_len: &mut usize,
-        worst_dist: &mut i32,
+        worst_dist: &mut i64,
         worst_pos: &mut usize,
     ) {
         for &ci in clusters {
@@ -224,7 +222,7 @@ impl SearchIndex {
 
             for j in start..end {
                 let base = j * STRIDE;
-                let dist = dist_scalar(query, &vectors[base..base + DIMS]);
+                let dist = dist_scalar(query, &vectors[base..base + STRIDE]);
 
                 if *top_len < K {
                     top[*top_len] = (dist, labels[j]);
@@ -254,7 +252,7 @@ impl SearchIndex {
 }
 
 #[inline(always)]
-fn labels_to_result(top: &[(i32, u8); K]) -> [Label; K] {
+fn labels_to_result(top: &[(i64, u8); K]) -> [Label; K] {
     let mut result = [Label::Legit; K];
     for (slot, &(_, label_byte)) in result.iter_mut().zip(top.iter()) {
         if label_byte == 1 {
@@ -265,27 +263,13 @@ fn labels_to_result(top: &[(i32, u8); K]) -> [Label; K] {
 }
 
 #[inline(always)]
-fn dist_scalar(query: &[i8; DIMS], record: &[u8]) -> i32 {
-    let mut dist: i32 = 0;
-    for d in 0..5 {
-        let diff = query[d] as i32 - (record[d] as i8) as i32;
+fn dist_scalar(query: &[i16; DIMS], record: &[u8]) -> i64 {
+    let mut dist: i64 = 0;
+    for d in 0..DIMS {
+        let off = d * 2;
+        let rv = i16::from_le_bytes([record[off], record[off + 1]]);
+        let diff = query[d] as i64 - rv as i64;
         dist += diff * diff;
-    }
-    for d in 7..DIMS {
-        let diff = query[d] as i32 - (record[d] as i8) as i32;
-        dist += diff * diff;
-    }
-    for d in 5..7 {
-        let q = query[d];
-        let r = record[d] as i8;
-        dist += match (q == SENTINEL, r == SENTINEL) {
-            (true, true) => 0,
-            (true, false) | (false, true) => SENTINEL_PENALTY,
-            (false, false) => {
-                let diff = q as i32 - r as i32;
-                diff * diff
-            }
-        };
     }
     dist
 }
@@ -296,8 +280,10 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn quantize(v: f32) -> i8 {
-        (v * 127.0).round().clamp(-127.0, 127.0) as i8
+    fn quantize(v: f32) -> i16 {
+        (v * 10_000.0)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16
     }
 
     fn make_index(records: &[([f32; DIMS], u8)]) -> NamedTempFile {
@@ -319,9 +305,9 @@ mod tests {
 
         for (vec, _) in records {
             for &v in vec {
-                f.write_all(&[quantize(v) as u8]).unwrap();
+                f.write_all(&quantize(v).to_le_bytes()).unwrap();
             }
-            f.write_all(&[0u8, 0u8]).unwrap();
+            f.write_all(&[0u8; 4]).unwrap();
         }
         for (_, label) in records {
             f.write_all(&[*label]).unwrap();
@@ -397,31 +383,20 @@ mod tests {
 
     #[test]
     fn sentinel_both_contribute_zero() {
-        let dist = dist_scalar(
-            &{
-                let mut q = [0i8; DIMS];
-                q[5] = SENTINEL;
-                q
-            },
-            &{
-                let mut r = [0u8; DIMS];
-                r[5] = SENTINEL as u8;
-                r
-            },
-        );
+        let mut q = [0i16; DIMS];
+        q[5] = quantize(-1.0);
+        let mut r = [0u8; STRIDE];
+        r[10..12].copy_from_slice(&quantize(-1.0).to_le_bytes());
+        let dist = dist_scalar(&q, &r);
         assert_eq!(dist, 0, "both sentinels → 0 distance");
     }
 
     #[test]
     fn sentinel_one_side_contributes_penalty() {
-        let dist = dist_scalar(
-            &{
-                let mut q = [0i8; DIMS];
-                q[5] = SENTINEL;
-                q
-            },
-            &[0u8; DIMS],
-        );
-        assert_eq!(dist, SENTINEL_PENALTY);
+        let mut q = [0i16; DIMS];
+        q[5] = quantize(-1.0);
+        let dist = dist_scalar(&q, &[0u8; STRIDE]);
+        let diff = quantize(-1.0) as i64;
+        assert_eq!(dist, diff * diff);
     }
 }

@@ -5,19 +5,20 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 /// IVF binary index format:
-///   [0..8]                magic: b"RINHIVF2"
+///   [0..8]                magic: b"RINHIVF3"
 ///   [8..12]               K: u32 le  (number of clusters)
 ///   [12..16]              N: u32 le  (total vector count)
 ///   [16..20]              dims: u32 le (= 14)
 ///   [20 .. 20+K*56]       centroids: K × [f32; 14], row-major, le
 ///   [.. .. +K*56+(K+1)*4] offsets: (K+1) × u32 le — record index of each cluster start
-///   [.. ..]               flat data: N × ([i8; 14] quantized + u8 label), sorted by cluster
-pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF2";
+///   [.. ..]               flat data: N × ([i16; 14] quantized + [u8; 4] padding), sorted by cluster
+pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
 const DIMS: usize = 14;
 const NLIST: usize = 4096;
 const KMEANS_ITERS: usize = 25;
 // k-means runs on this many vectors; final assignment is one pass over all N
 const SAMPLE_SIZE: usize = 60_000;
+const QUANT_SCALE: f32 = 10_000.0;
 
 #[derive(Deserialize)]
 struct Reference {
@@ -26,8 +27,10 @@ struct Reference {
 }
 
 #[inline]
-fn quantize(v: f32) -> i8 {
-    (v * 127.0).round().clamp(-127.0, 127.0) as i8
+fn quantize(v: f32) -> i16 {
+    (v * QUANT_SCALE)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 /// Squared L2 distance between a vector and a centroid stored in a flat slice.
@@ -269,12 +272,12 @@ fn main() {
         writer.write_all(&o.to_le_bytes()).unwrap();
     }
 
-    // Vectors in cluster order: N × [i8; 14] + [0u8; 2] padding = 16 bytes each
+    // Vectors in cluster order: N × [i16; 14] + [0u8; 4] padding = 32 bytes each
     for &idx in &order {
         for &v in &vectors[idx] {
-            writer.write_all(&[quantize(v) as u8]).unwrap();
+            writer.write_all(&quantize(v).to_le_bytes()).unwrap();
         }
-        writer.write_all(&[0u8, 0u8]).unwrap();
+        writer.write_all(&[0u8; 4]).unwrap();
     }
 
     // Labels in cluster order: N × u8
@@ -284,6 +287,6 @@ fn main() {
 
     writer.flush().unwrap();
 
-    let file_size = 20 + nlist_actual * DIMS * 4 + (nlist_actual + 1) * 4 + n * 16 + n;
+    let file_size = 20 + nlist_actual * DIMS * 4 + (nlist_actual + 1) * 4 + n * 32 + n;
     eprintln!("preprocessor: wrote {output_path} ({file_size} bytes, IVF NLIST={nlist_actual})");
 }

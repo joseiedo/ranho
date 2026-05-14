@@ -85,13 +85,14 @@ impl Vectorizer {
         ]
     }
 
-    /// Quantize a float vector to i8.
-    /// Range [0.0, 1.0] maps to [0, 127].
-    /// Sentinel -1.0 maps to -127 naturally: (-1.0 * 127.0).round() = -127.
-    pub fn quantize(vector: &[f32; 14]) -> [i8; 14] {
-        let mut out = [0i8; 14];
+    /// Quantize a float vector to i16 using the same scale as the IVF index.
+    /// Sentinel -1.0 maps to -10000 naturally.
+    pub fn quantize(vector: &[f32; 14]) -> [i16; 14] {
+        let mut out = [0i16; 14];
         for (i, &v) in vector.iter().enumerate() {
-            out[i] = (v * 127.0).round().clamp(-127.0, 127.0) as i8;
+            out[i] = (v * 10_000.0)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         }
         out
     }
@@ -429,13 +430,13 @@ mod tests {
     #[test]
     fn quantize_zero() {
         let v = [0.0f32; 14];
-        assert_eq!(Vectorizer::quantize(&v), [0i8; 14]);
+        assert_eq!(Vectorizer::quantize(&v), [0i16; 14]);
     }
 
     #[test]
     fn quantize_one() {
         let v = [1.0f32; 14];
-        assert_eq!(Vectorizer::quantize(&v), [127i8; 14]);
+        assert_eq!(Vectorizer::quantize(&v), [10_000i16; 14]);
     }
 
     #[test]
@@ -444,7 +445,7 @@ mod tests {
         v[5] = -1.0;
         v[6] = -1.0;
         let q = Vectorizer::quantize(&v);
-        assert_eq!(q[5], -127);
-        assert_eq!(q[6], -127);
+        assert_eq!(q[5], -10_000);
+        assert_eq!(q[6], -10_000);
     }
 }
