@@ -7,7 +7,8 @@ const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 const STRIDE: usize = 16;
 const K: usize = 5;
-const NPROBE_FAST: usize = 3;
+const NPROBE_FAST: usize = 8;
+const NPROBE_SLOW: usize = 48;
 const SENTINEL: i8 = -127;
 const SENTINEL_PENALTY: i32 = 64516;
 
@@ -137,8 +138,11 @@ impl SearchIndex {
             query_f32[d] = query[d] as f32 / 127.0;
         }
 
-        let nprobe = NPROBE_FAST.min(self.k_clusters);
-        let mut best = [(u32::MAX, 0usize); NPROBE_FAST];
+        // Pre-compute top NPROBE_SLOW centroid distances in one pass.
+        // NPROBE_FAST is a prefix of this list — same ordering, no second scan.
+        let nprobe_slow = NPROBE_SLOW.min(self.k_clusters);
+        let nprobe_fast = NPROBE_FAST.min(nprobe_slow);
+        let mut best = [(u32::MAX, 0usize); NPROBE_SLOW];
 
         for (ci, c) in self.centroids.iter().enumerate() {
             let mut d = 0.0f32;
@@ -147,9 +151,9 @@ impl SearchIndex {
                 d += diff * diff;
             }
             let db = d.to_bits();
-            if db < best[nprobe - 1].0 {
-                best[nprobe - 1] = (db, ci);
-                let mut i = nprobe - 1;
+            if db < best[nprobe_slow - 1].0 {
+                best[nprobe_slow - 1] = (db, ci);
+                let mut i = nprobe_slow - 1;
                 while i > 0 && best[i].0 < best[i - 1].0 {
                     best.swap(i, i - 1);
                     i -= 1;
@@ -157,7 +161,8 @@ impl SearchIndex {
             }
         }
 
-        let mut probed = [0usize; NPROBE_FAST];
+        // Cluster indices sorted by distance — fast probes are the first slice.
+        let mut probed = [0usize; NPROBE_SLOW];
         for (slot, &(_, ci)) in probed.iter_mut().zip(best.iter()) {
             *slot = ci;
         }
@@ -167,16 +172,39 @@ impl SearchIndex {
         let mut worst_dist = i32::MAX;
         let mut worst_pos = 0usize;
 
-        self.scan_clusters(query, vectors, labels, &probed[..nprobe],
-            &mut top, &mut top_len, &mut worst_dist, &mut worst_pos);
+        // ── Phase 1: fast probe ───────────────────────────────────────────────
+        self.scan_clusters(
+            query,
+            vectors,
+            labels,
+            &probed[..nprobe_fast],
+            &mut top,
+            &mut top_len,
+            &mut worst_dist,
+            &mut worst_pos,
+        );
 
-        let mut result = [Label::Legit; K];
-        for (slot, &(_, label_byte)) in result.iter_mut().zip(top[..top_len].iter()) {
-            if label_byte == 1 {
-                *slot = Label::Fraud;
-            }
+        let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
+
+        // Result is unambiguous (0, 1, 4, or 5 fraud) and we have K neighbors
+        // — no need to probe more lists.
+        if top_len >= K && fraud_count != 2 && fraud_count != 3 {
+            return labels_to_result(&top);
         }
-        result
+
+        // ── Phase 2: slow probe (remaining lists up to NPROBE_SLOW) ───────────
+        self.scan_clusters(
+            query,
+            vectors,
+            labels,
+            &probed[nprobe_fast..nprobe_slow],
+            &mut top,
+            &mut top_len,
+            &mut worst_dist,
+            &mut worst_pos,
+        );
+
+        labels_to_result(&top)
     }
 
     fn scan_clusters(
@@ -225,6 +253,16 @@ impl SearchIndex {
     }
 }
 
+#[inline(always)]
+fn labels_to_result(top: &[(i32, u8); K]) -> [Label; K] {
+    let mut result = [Label::Legit; K];
+    for (slot, &(_, label_byte)) in result.iter_mut().zip(top.iter()) {
+        if label_byte == 1 {
+            *slot = Label::Fraud;
+        }
+    }
+    result
+}
 
 #[inline(always)]
 fn dist_scalar(query: &[i8; DIMS], record: &[u8]) -> i32 {
