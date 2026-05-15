@@ -107,34 +107,41 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query: &[i16; DIMS]) -> [Label; K] {
-        #[cfg(target_arch = "x86_64")]
-        return unsafe { self.search_avx2(query) };
-        #[cfg(target_arch = "aarch64")]
-        return unsafe { self.search_neon(query) };
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        return self.search_impl(query);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn search_avx2(&self, query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl(query)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
-    unsafe fn search_neon(&self, query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl(query)
-    }
-
-    fn search_impl(&self, query: &[i16; DIMS]) -> [Label; K] {
-        let vectors = &self.mmap[self.data_byte..self.labels_byte];
-        let labels = &self.mmap[self.labels_byte..];
-
         let mut query_f32 = [0.0f32; DIMS];
         for d in 0..DIMS {
             query_f32[d] = query[d] as f32 / 10_000.0;
         }
+        self.search_impl(&query_f32, query)
+    }
+
+    pub fn search_with_vector(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        self.search_impl(query_f32, query)
+    }
+
+    fn search_impl(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        #[cfg(target_arch = "x86_64")]
+        return unsafe { self.search_avx2(query_f32, query) };
+        #[cfg(target_arch = "aarch64")]
+        return unsafe { self.search_neon(query_f32, query) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return self.search_impl_inner(query_f32, query);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn search_avx2(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        self.search_impl_inner(query_f32, query)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn search_neon(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        self.search_impl_inner(query_f32, query)
+    }
+
+    fn search_impl_inner(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        let vectors = &self.mmap[self.data_byte..self.labels_byte];
+        let labels = &self.mmap[self.labels_byte..];
 
         // Pre-compute top NPROBE_SLOW centroid distances in one pass.
         // NPROBE_FAST is a prefix of this list — same ordering, no second scan.
@@ -161,7 +168,10 @@ impl SearchIndex {
 
         // Cluster indices sorted by distance — fast probes are the first slice.
         let mut probed = [0usize; NPROBE_SLOW];
-        for (slot, &(_, ci)) in probed.iter_mut().zip(best.iter()) {
+        for (slot, &(_, ci)) in probed[..nprobe_slow]
+            .iter_mut()
+            .zip(best[..nprobe_slow].iter())
+        {
             *slot = ci;
         }
 
@@ -184,9 +194,9 @@ impl SearchIndex {
 
         let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
 
-        // Result is unambiguous (0, 1, 4, or 5 fraud) and we have K neighbors
-        // — no need to probe more lists.
-        if top_len >= K && fraud_count != 2 && fraud_count != 3 {
+        // Result is unambiguous for 0, 1, or 5 fraud and we have K neighbors.
+        // A 4/5 split still looks suspicious enough to justify the slow pass.
+        if top_len >= K && (fraud_count == 0 || fraud_count == 1 || fraud_count == 5) {
             return labels_to_result(&top);
         }
 
@@ -399,4 +409,5 @@ mod tests {
         let diff = quantize(-1.0) as i64;
         assert_eq!(dist, diff * diff);
     }
+
 }

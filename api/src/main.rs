@@ -60,7 +60,7 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
 
     let vector = state.vectorizer.vectorize(&payload);
     let quantized = Vectorizer::quantize(&vector);
-    let neighbors = index.search(&quantized);
+    let neighbors = index.search_with_vector(&vector, &quantized);
     let fraud_count = neighbors.iter().filter(|&&l| l == Label::Fraud).count();
 
     (JSON, FRAUD_RESPONSES[fraud_count])
