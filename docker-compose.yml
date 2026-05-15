@@ -24,7 +24,6 @@ services:
     cpuset: "0"
     environment:
       INDEX_PATH: /app/resources/index.bin
-      MCC_RISK_PATH: /app/resources/mcc_risk.json
       SOCKET_PATH: /run/sock/api1.sock
     volumes:
       - sock:/run/sock
@@ -48,7 +47,6 @@ services:
     cpuset: "2"
     environment:
       INDEX_PATH: /app/resources/index.bin
-      MCC_RISK_PATH: /app/resources/mcc_risk.json
       SOCKET_PATH: /run/sock/api2.sock
     volumes:
       - sock:/run/sock

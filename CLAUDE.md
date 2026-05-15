@@ -17,8 +17,7 @@ cargo test -p api dim0_normal
 # Build release binary (with AVX2 for Haswell)
 RUSTFLAGS="-C target-cpu=haswell" cargo build --release
 
-# Run the API locally (needs mcc_risk.json and index.bin)
-MCC_RISK_PATH=../rinha-de-backend-2026/resources/mcc_risk.json \
+# Run the API locally (needs index.bin)
 INDEX_PATH=../rinha-de-backend-2026/resources/index.bin \
 cargo run -p api
 

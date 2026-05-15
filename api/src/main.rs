@@ -75,15 +75,21 @@ fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
 
 #[tokio::main(worker_threads = 1)]
 async fn main() {
-    let mcc_risk_path =
-        std::env::var("MCC_RISK_PATH").unwrap_or_else(|_| "./resources/mcc_risk.json".to_string());
-
-    eprintln!("loading mcc_risk from {mcc_risk_path}");
-    let mcc_risk: HashMap<String, f32> = std::fs::read_to_string(&mcc_risk_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    eprintln!("mcc_risk loaded: {} entries", mcc_risk.len());
+    let mcc_risk: HashMap<String, f32> = [
+        ("5411", 0.15),
+        ("5812", 0.30),
+        ("5912", 0.20),
+        ("5944", 0.45),
+        ("7801", 0.80),
+        ("7802", 0.75),
+        ("7995", 0.85),
+        ("4511", 0.35),
+        ("5311", 0.25),
+        ("5999", 0.50),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
 
     let index_path =
         std::env::var("INDEX_PATH").unwrap_or_else(|_| "./resources/index.bin".to_string());

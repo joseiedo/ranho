@@ -34,9 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 WORKDIR /app
 COPY --from=builder  /build/target/release/api ./
 COPY --from=builder  /build/index.bin           ./resources/
-COPY resources/mcc_risk.json                    ./resources/
 
 ENV INDEX_PATH=/app/resources/index.bin
-ENV MCC_RISK_PATH=/app/resources/mcc_risk.json
 
 CMD ["./api"]
