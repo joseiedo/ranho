@@ -7,8 +7,10 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - sock:/run/sock
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -18,8 +20,7 @@ services:
       - rinha
 
   api1:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
-    platform: linux/amd64
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:latest
     environment:
       INDEX_PATH: /app/resources/index.bin
       SOCKET_PATH: /run/sock/api1.sock
@@ -27,6 +28,11 @@ services:
       - sock:/run/sock
     ulimits:
       nofile: 65535
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sock/api1.sock", "http://localhost/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
     deploy:
       resources:
         limits:
@@ -36,8 +42,7 @@ services:
       - rinha
 
   api2:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
-    platform: linux/amd64
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:latest
     environment:
       INDEX_PATH: /app/resources/index.bin
       SOCKET_PATH: /run/sock/api2.sock
@@ -45,6 +50,11 @@ services:
       - sock:/run/sock
     ulimits:
       nofile: 65535
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--unix-socket", "/run/sock/api2.sock", "http://localhost/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
     deploy:
       resources:
         limits:
@@ -59,7 +69,6 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "size=4m,mode=0777"
 
 networks:
   rinha:
