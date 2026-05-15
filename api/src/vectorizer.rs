@@ -26,8 +26,12 @@ const DOW_LUT: [f32; 7] = [
     4.0 / 6.0, 5.0 / 6.0, 6.0 / 6.0,
 ];
 
+fn round4(x: f32) -> f32 {
+    (x * 10_000.0).round() / 10_000.0
+}
+
 fn clamp01(x: f32) -> f32 {
-    x.clamp(0.0, 1.0)
+    round4(x.clamp(0.0, 1.0))
 }
 
 pub struct Vectorizer {

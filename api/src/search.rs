@@ -8,7 +8,7 @@ const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
 const NPROBE_FAST: usize = 8;
-const NPROBE_SLOW: usize = 48;
+const NPROBE_SLOW: usize = 64;
 
 pub struct SearchIndex {
     mmap: Mmap,
