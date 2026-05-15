@@ -1,15 +1,3 @@
-/// Full pipeline integration test against the official test-data.json.
-///
-/// Marked `#[ignore]` so it only runs when explicitly requested.
-/// By default tests the first 500 entries; set INTEGRATION_LIMIT=0 for all 54K.
-///
-/// Requires the binary index built by the preprocessor.
-///
-/// Run:
-///   INDEX_PATH=/path/to/index.bin \
-///   MCC_RISK_PATH=/path/to/mcc_risk.json \
-///   TEST_DATA_PATH=/path/to/test-data.json \
-///   cargo test -p api --test integration --release -- --ignored --nocapture
 use api::scorer::score;
 use api::search::SearchIndex;
 use api::vectorizer::Vectorizer;
@@ -45,7 +33,6 @@ fn full_pipeline_failure_rate_under_5pct() {
     let test_data_path = std::env::var("TEST_DATA_PATH")
         .unwrap_or_else(|_| "../../rinha-de-backend-2026/test/test-data.json".to_string());
 
-    // Default to 500 entries to keep test time manageable; set to 0 for all.
     let limit: usize = std::env::var("INTEGRATION_LIMIT")
         .ok()
         .and_then(|s| s.parse().ok())

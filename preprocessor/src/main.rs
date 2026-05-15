@@ -4,19 +4,10 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-/// IVF binary index format:
-///   [0..8]                magic: b"RINHIVF3"
-///   [8..12]               K: u32 le  (number of clusters)
-///   [12..16]              N: u32 le  (total vector count)
-///   [16..20]              dims: u32 le (= 14)
-///   [20 .. 20+K*56]       centroids: K × [f32; 14], row-major, le
-///   [.. .. +K*56+(K+1)*4] offsets: (K+1) × u32 le — record index of each cluster start
-///   [.. ..]               flat data: N × ([i16; 14] quantized + [u8; 4] padding), sorted by cluster
 pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
 const DIMS: usize = 14;
 const NLIST: usize = 4096;
 const KMEANS_ITERS: usize = 25;
-// k-means runs on this many vectors; final assignment is one pass over all N
 const SAMPLE_SIZE: usize = 60_000;
 const QUANT_SCALE: f32 = 10_000.0;
 
@@ -33,13 +24,10 @@ fn quantize(v: f32) -> i16 {
         .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
-/// Squared L2 distance between a vector and a centroid stored in a flat slice.
-/// `centroids_flat` is laid out as [c0d0, c0d1, ..., c0d13, c1d0, ...].
 #[inline(always)]
 fn sq_dist_to_centroid(v: &[f32; DIMS], centroids_flat: &[f32], ci: usize) -> f32 {
     let base = ci * DIMS;
     let mut d = 0.0f32;
-    // Fixed-size loop — compiler will unroll + auto-vectorize (AVX2 on x86)
     for k in 0..DIMS {
         let diff = v[k] - centroids_flat[base + k];
         d += diff * diff;
@@ -47,7 +35,6 @@ fn sq_dist_to_centroid(v: &[f32; DIMS], centroids_flat: &[f32], ci: usize) -> f3
     d
 }
 
-/// Find the nearest centroid index for vector `v`.
 #[inline]
 fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
     let mut best = 0u32;
@@ -62,16 +49,13 @@ fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
     best
 }
 
-/// k-means++ initialisation over the sample indices.
 fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Vec<f32> {
     let mut flat = vec![0.0f32; nlist * DIMS];
     let mut dmin = vec![f32::MAX; sample.len()];
 
-    // Pick first centroid at index 0 of the sample
     flat[..DIMS].copy_from_slice(&vectors[sample[0]]);
 
     for c in 1..nlist {
-        // Update dmin against the centroid we just added
         let prev_base = (c - 1) * DIMS;
         for (i, &si) in sample.iter().enumerate() {
             let v = &vectors[si];
@@ -85,7 +69,6 @@ fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Ve
             }
         }
 
-        // Weighted pick: use a cheap deterministic threshold based on centroid index
         let total: f64 = dmin.iter().map(|&x| x as f64).sum();
         let chosen = if total <= 0.0 {
             0
@@ -121,7 +104,6 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "./resources/index.bin".to_string());
 
-    // ── 1. Parse ─────────────────────────────────────────────────────────────
     eprintln!("preprocessor: reading {input_path}");
     let file = File::open(&input_path).expect("failed to open input");
     let gz = GzDecoder::new(file);
@@ -140,24 +122,19 @@ fn main() {
 
     let nlist_actual = NLIST.min(n);
 
-    // ── 2. Sample ─────────────────────────────────────────────────────────────
-    // Evenly-spaced sample — no extra deps, good coverage
     let sample_size = SAMPLE_SIZE.min(n);
     let sample: Vec<usize> = (0..sample_size).map(|i| i * (n / sample_size)).collect();
     eprintln!(
         "preprocessor: k-means on sample={sample_size} (NLIST={nlist_actual}, iters={KMEANS_ITERS})"
     );
 
-    // ── 3. k-means++ init on sample ───────────────────────────────────────────
     eprintln!("preprocessor: kmeans++ init...");
     let mut centroids_flat = kmeans_pp_init(&vectors, &sample, nlist_actual);
 
-    // ── 4. k-means iterations on sample (parallel assignment + parallel reduce)
     let mut sample_assignments = vec![0u32; sample_size];
     let nthreads = rayon::current_num_threads();
 
     for iter in 0..KMEANS_ITERS {
-        // Parallel assignment over sample
         let new_assignments: Vec<u32> = sample
             .par_iter()
             .map(|&si| nearest(&vectors[si], &centroids_flat, nlist_actual))
@@ -170,7 +147,6 @@ fn main() {
             .count();
         sample_assignments = new_assignments;
 
-        // Parallel accumulation with per-thread buffers, then reduce
         let chunk = (sample_size + nthreads - 1) / nthreads;
         let thread_results: Vec<(Vec<f64>, Vec<u32>)> = (0..nthreads)
             .into_par_iter()
@@ -192,7 +168,6 @@ fn main() {
             })
             .collect();
 
-        // Reduce into global buffers
         let mut global_sums = vec![0.0f64; nlist_actual * DIMS];
         let mut global_counts = vec![0u32; nlist_actual];
         for (sums, counts) in &thread_results {
@@ -204,7 +179,6 @@ fn main() {
             }
         }
 
-        // Update centroids
         for ci in 0..nlist_actual {
             if global_counts[ci] > 0 {
                 let inv = 1.0 / global_counts[ci] as f64;
@@ -224,14 +198,12 @@ fn main() {
         }
     }
 
-    // ── 5. Assign ALL vectors — single parallel pass over full dataset ─────────
     eprintln!("preprocessor: assigning all {n} vectors to final centroids...");
     let assignments: Vec<u32> = vectors
         .par_iter()
         .map(|v| nearest(v, &centroids_flat, nlist_actual))
         .collect();
 
-    // ── 6. Count + sort by cluster ────────────────────────────────────────────
     eprintln!("preprocessor: sorting vectors by cluster...");
     let mut counts = vec![0u32; nlist_actual];
     for &c in &assignments {
@@ -249,12 +221,10 @@ fn main() {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| assignments[i]);
 
-    // ── 7. Write index ────────────────────────────────────────────────────────
     eprintln!("preprocessor: writing IVF index...");
     let out = File::create(&output_path).expect("failed to create output");
     let mut writer = BufWriter::new(out);
 
-    // Header (20 bytes)
     writer.write_all(IVF_MAGIC).unwrap();
     writer
         .write_all(&(nlist_actual as u32).to_le_bytes())
@@ -262,17 +232,14 @@ fn main() {
     writer.write_all(&(n as u32).to_le_bytes()).unwrap();
     writer.write_all(&(DIMS as u32).to_le_bytes()).unwrap();
 
-    // Centroids: NLIST × DIMS × f32 (flat buffer, already correct layout)
     for &v in &centroids_flat {
         writer.write_all(&v.to_le_bytes()).unwrap();
     }
 
-    // Cluster start offsets: (NLIST+1) × u32
     for &o in &cluster_starts {
         writer.write_all(&o.to_le_bytes()).unwrap();
     }
 
-    // Vectors in cluster order: N × [i16; 14] + [0u8; 4] padding = 32 bytes each
     for &idx in &order {
         for &v in &vectors[idx] {
             writer.write_all(&quantize(v).to_le_bytes()).unwrap();
@@ -280,7 +247,6 @@ fn main() {
         writer.write_all(&[0u8; 4]).unwrap();
     }
 
-    // Labels in cluster order: N × u8
     for &idx in &order {
         writer.write_all(&[labels[idx]]).unwrap();
     }

@@ -29,7 +29,6 @@ mod tests {
 
     #[test]
     fn three_fraud_is_denied() {
-        // 3/5 = 0.6 → not < 0.6 → denied
         let neighbors = [Label::Fraud, Label::Fraud, Label::Fraud, Label::Legit, Label::Legit];
         let (score, approved) = score(neighbors);
         assert_eq!(score, 0.6);
@@ -38,7 +37,6 @@ mod tests {
 
     #[test]
     fn two_fraud_is_approved() {
-        // 2/5 = 0.4 → approved
         let neighbors = [Label::Fraud, Label::Fraud, Label::Legit, Label::Legit, Label::Legit];
         let (score, approved) = score(neighbors);
         assert_eq!(score, 0.4);

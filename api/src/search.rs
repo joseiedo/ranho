@@ -143,8 +143,6 @@ impl SearchIndex {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
         let labels = &self.mmap[self.labels_byte..];
 
-        // Pre-compute top NPROBE_SLOW centroid distances in one pass.
-        // NPROBE_FAST is a prefix of this list — same ordering, no second scan.
         let nprobe_slow = NPROBE_SLOW.min(self.k_clusters);
         let nprobe_fast = NPROBE_FAST.min(nprobe_slow);
         let mut best = [(u32::MAX, 0usize); NPROBE_SLOW];
@@ -166,7 +164,6 @@ impl SearchIndex {
             }
         }
 
-        // Cluster indices sorted by distance — fast probes are the first slice.
         let mut probed = [0usize; NPROBE_SLOW];
         for (slot, &(_, ci)) in probed[..nprobe_slow]
             .iter_mut()
@@ -180,7 +177,6 @@ impl SearchIndex {
         let mut worst_dist = i64::MAX;
         let mut worst_pos = 0usize;
 
-        // ── Phase 1: fast probe ───────────────────────────────────────────────
         self.scan_clusters(
             query,
             vectors,
@@ -194,13 +190,10 @@ impl SearchIndex {
 
         let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
 
-        // Result is unambiguous for 0, 1, or 5 fraud and we have K neighbors.
-        // A 4/5 split still looks suspicious enough to justify the slow pass.
         if top_len >= K && (fraud_count == 0 || fraud_count == 1 || fraud_count == 5) {
             return labels_to_result(&top);
         }
 
-        // ── Phase 2: slow probe (remaining lists up to NPROBE_SLOW) ───────────
         self.scan_clusters(
             query,
             vectors,

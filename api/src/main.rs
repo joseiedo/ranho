@@ -29,14 +29,10 @@ static FRAUD_RESPONSES: [&[u8]; 6] = [
     br#"{"approved":false,"fraud_score":1.0}"#,
 ];
 
-// ── App state ─────────────────────────────────────────────────────────────────
-
 struct AppState {
     vectorizer: Vectorizer,
     index: Option<SearchIndex>,
 }
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
     if state.index.is_some() {
