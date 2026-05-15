@@ -1,3 +1,4 @@
+pub mod normalization;
 pub mod scorer;
 pub mod search;
 pub mod types;
