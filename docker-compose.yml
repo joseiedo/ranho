@@ -12,7 +12,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.2"
           memory: "30MB"
     networks:
       - rinha
@@ -24,8 +24,6 @@ services:
       INDEX_PATH: /app/index.bin
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: "32"
-      WARMUP_COUNT: "2000"
     volumes:
       - sock:/run/sock
     ulimits:
@@ -33,7 +31,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "155MB"
     networks:
       - rinha
@@ -45,8 +43,6 @@ services:
       INDEX_PATH: /app/index.bin
       MCC_RISK_PATH: /app/mcc_risk.json
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: "32"
-      WARMUP_COUNT: "2000"
     volumes:
       - sock:/run/sock
     ulimits:
@@ -54,7 +50,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.40"
           memory: "155MB"
     networks:
       - rinha
