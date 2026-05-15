@@ -21,11 +21,10 @@ services:
       - rinha
 
   api1:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.1
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
     platform: linux/amd64
     environment:
       INDEX_PATH: /app/resources/index.bin
-      MCC_RISK_PATH: /app/resources/mcc_risk.json
       SOCKET_PATH: /run/sock/api1.sock
     volumes:
       - sock:/run/sock
@@ -40,11 +39,10 @@ services:
       - rinha
 
   api2:
-    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.1
+    image: ghcr.io/joseiedo/rinha-de-backend-2026:0.0.2
     platform: linux/amd64
     environment:
       INDEX_PATH: /app/resources/index.bin
-      MCC_RISK_PATH: /app/resources/mcc_risk.json
       SOCKET_PATH: /run/sock/api2.sock
     volumes:
       - sock:/run/sock
