@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TEST_DIR="./challenge-guide/test"
+TEST_DIR="./spec/test"
 
 # docker buildx build --platform linux/amd64 -t rinha-2026:local .
 #
