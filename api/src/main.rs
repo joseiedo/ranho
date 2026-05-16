@@ -13,8 +13,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+
 use bytes::Bytes;
-use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{collections::HashMap, sync::Arc};
 
 static FRAUD_RESPONSES: [&[u8]; 6] = [
     br#"{"approved":true,"fraud_score":0.0}"#,
@@ -28,17 +29,10 @@ static FRAUD_RESPONSES: [&[u8]; 6] = [
 struct AppState {
     vectorizer: Vectorizer,
     index: Option<SearchIndex>,
-    warmed_up: AtomicBool,
 }
 
-async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.warmed_up.load(Ordering::Relaxed) {
-        eprintln!("[ready] 200 OK");
-        StatusCode::OK
-    } else {
-        eprintln!("[ready] 503 warming up");
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+async fn ready() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
@@ -65,8 +59,7 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     (JSON, FRAUD_RESPONSES[fraud_count])
 }
 
-#[tokio::main(worker_threads = 1)]
-async fn main() {
+fn main() {
     let mcc_risk: HashMap<String, f32> = [
         ("5411", 0.15),
         ("5812", 0.30),
@@ -98,28 +91,30 @@ async fn main() {
         }
     };
 
-    let vectorizer = Vectorizer::new(mcc_risk);
-
-    let state = Arc::new(AppState { vectorizer, index, warmed_up: AtomicBool::new(false) });
-
-    if state.index.is_some() {
-        let state2 = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || {
-            eprintln!("warming up...");
-            state2.index.as_ref().unwrap().warmup();
-            state2.warmed_up.store(true, Ordering::Relaxed);
-            eprintln!("warmup done");
-        });
+    if let Some(ref idx) = index {
+        eprintln!("warming up...");
+        idx.warmup();
+        eprintln!("warmup done");
     }
 
-    let app = Router::new()
-        .route("/ready", get(ready))
-        .route("/fraud-score", post(fraud_score))
-        .with_state(state);
+    let vectorizer = Vectorizer::new(mcc_risk);
+    let state = Arc::new(AppState { vectorizer, index });
 
-    let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let app = Router::new()
+                .route("/ready", get(ready))
+                .route("/fraud-score", post(fraud_score))
+                .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    eprintln!("listening on http://{addr}");
-    axum::serve(listener, app).await.unwrap();
+            let addr =
+                std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            eprintln!("listening on http://{addr}");
+            axum::serve(listener, app).await.unwrap();
+        });
 }
