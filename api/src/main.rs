@@ -46,7 +46,10 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     let payload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[fraud-score] parse error: {e} body={:?}", String::from_utf8_lossy(&body));
+            eprintln!(
+                "[fraud-score] parse error: {e} body={:?}",
+                String::from_utf8_lossy(&body)
+            );
             return (JSON, FRAUD_RESPONSES[0]);
         }
     };
@@ -91,11 +94,11 @@ fn main() {
         }
     };
 
-    // if let Some(ref idx) = index {
-    //     eprintln!("warming up...");
-    //     idx.warmup();
-    //     eprintln!("warmup done");
-    // }
+    if let Some(ref idx) = index {
+        eprintln!("warming up...");
+        idx.warmup();
+        eprintln!("warmup done");
+    }
 
     let vectorizer = Vectorizer::new(mcc_risk);
     let state = Arc::new(AppState { vectorizer, index });
@@ -110,8 +113,7 @@ fn main() {
                 .route("/fraud-score", post(fraud_score))
                 .with_state(state);
 
-            let addr =
-                std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+            let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             eprintln!("listening on http://{addr}");
