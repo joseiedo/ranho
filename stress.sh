@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEST_DIR="./spec/test"
 
-# docker buildx build --platform linux/amd64 -t rinha-2026:local .
+docker buildx build --platform linux/amd64 -t rinha-2026:local .
 #
 echo "==> Bringing up containers..."
 docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d --wait

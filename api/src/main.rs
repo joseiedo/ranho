@@ -114,21 +114,10 @@ async fn main() {
         .route("/fraud-score", post(fraud_score))
         .with_state(state);
 
-    let socket_path = std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
+    let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
-    eprintln!("opening socket at {socket_path}");
-    let _ = std::fs::remove_file(&socket_path);
-    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777)).ok();
-    }
-    eprintln!("listening on unix:{socket_path}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    eprintln!("listening on http://{addr}");
     let mut make_service = app.into_make_service();
 
     loop {

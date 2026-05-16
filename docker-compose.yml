@@ -1,9 +1,7 @@
 x-api: &api
-  image: ghcr.io/joseiedo/rinha-de-backend-2026:latest
+  image: rinha-2026:local
   environment:
     INDEX_PATH: /app/resources/index.bin
-  volumes:
-    - sock:/run/sock
   ulimits:
     nofile: 65535
   deploy:
@@ -19,13 +17,13 @@ services:
     <<: *api
     environment:
       INDEX_PATH: /app/resources/index.bin
-      SOCKET_PATH: /run/sock/api1.sock
+      LISTEN_ADDR: "0.0.0.0:3000"
 
   api2:
     <<: *api
     environment:
       INDEX_PATH: /app/resources/index.bin
-      SOCKET_PATH: /run/sock/api2.sock
+      LISTEN_ADDR: "0.0.0.0:3000"
 
   nginx:
     image: nginx:alpine
@@ -33,7 +31,6 @@ services:
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - sock:/run/sock
     depends_on:
       - api1
       - api2
@@ -44,13 +41,6 @@ services:
           memory: "30MB"
     networks:
       - rinha
-
-volumes:
-  sock:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
 
 networks:
   rinha:
