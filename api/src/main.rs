@@ -15,7 +15,10 @@ use axum::{
 };
 
 use bytes::Bytes;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use std::{collections::HashMap, sync::Arc};
+use tower_service::Service;
 
 static FRAUD_RESPONSES: [&[u8]; 6] = [
     br#"{"approved":true,"fraud_score":0.0}"#,
@@ -104,6 +107,24 @@ fn main() {
 
             let _ = std::fs::remove_file(&socket_path);
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            axum::serve(listener, app).await.unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let builder = Builder::new(TokioExecutor::new());
+
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let app = app.clone();
+                let builder = builder.clone();
+                tokio::spawn(async move {
+                    builder
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(move |req| app.clone().call(req)),
+                        )
+                        .await
+                        .ok();
+                });
+            }
         });
 }
