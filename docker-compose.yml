@@ -2,7 +2,6 @@ x-api: &api
   image: rinha-2026:local
   ulimits:
     nofile: 65535
-    memlock: -1
   volumes:
     - sockets:/sockets
   deploy:
@@ -14,14 +13,12 @@ x-api: &api
 services:
   api1:
     <<: *api
-    cpuset: "0"
     environment:
       INDEX_PATH: /app/resources/index.bin
       SOCKET_PATH: /sockets/api1.sock
 
   api2:
     <<: *api
-    cpuset: "1"
     environment:
       INDEX_PATH: /app/resources/index.bin
       SOCKET_PATH: /sockets/api2.sock
