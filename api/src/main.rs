@@ -14,11 +14,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
-use tower_service::Service;
+use std::{collections::HashMap, sync::Arc};
 
 static FRAUD_RESPONSES: [&[u8]; 6] = [
     br#"{"approved":true,"fraud_score":0.0}"#,
@@ -66,13 +62,6 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     let fraud_count = neighbors.iter().filter(|&&l| l == Label::Fraud).count();
 
     (JSON, FRAUD_RESPONSES[fraud_count])
-}
-
-fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
-    match result {
-        Ok(v) => v,
-        Err(e) => match e {},
-    }
 }
 
 #[tokio::main(worker_threads = 1)]
@@ -124,20 +113,5 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("listening on http://{addr}");
-    let mut make_service = app.into_make_service();
-
-    loop {
-        let (socket, _) = listener.accept().await.unwrap();
-        let svc: axum::Router = unwrap_infallible(make_service.call(()).await);
-
-        tokio::spawn(async move {
-            let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
-                svc.clone().call(req)
-            });
-            Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(socket), hyper_svc)
-                .await
-                .ok();
-        });
-    }
+    axum::serve(listener, app).await.unwrap();
 }
