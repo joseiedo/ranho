@@ -39,17 +39,12 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     const JSON: [(header::HeaderName, &str); 1] = [(header::CONTENT_TYPE, "application/json")];
 
     let Some(index) = &state.index else {
-        eprintln!("[fraud-score] index not loaded, returning fallback");
         return (JSON, FRAUD_RESPONSES[0]);
     };
 
     let payload = match serde_json::from_slice(&body) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "[fraud-score] parse error: {e} body={:?}",
-                String::from_utf8_lossy(&body)
-            );
+        Err(_) => {
             return (JSON, FRAUD_RESPONSES[0]);
         }
     };
@@ -82,22 +77,13 @@ fn main() {
     let index_path =
         std::env::var("INDEX_PATH").unwrap_or_else(|_| "./resources/index.bin".to_string());
 
-    eprintln!("loading index from {index_path}");
     let index = match SearchIndex::open(&index_path) {
-        Ok(idx) => {
-            eprintln!("index loaded: {} vectors", idx.count());
-            Some(idx)
-        }
-        Err(e) => {
-            eprintln!("warning: could not load index ({e}); /ready will return 503");
-            None
-        }
+        Ok(idx) => Some(idx),
+        Err(_) => None,
     };
 
     if let Some(ref idx) = index {
-        eprintln!("warming up...");
         idx.warmup();
-        eprintln!("warmup done");
     }
 
     let vectorizer = Vectorizer::new(mcc_risk);
@@ -116,7 +102,6 @@ fn main() {
             let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            eprintln!("listening on http://{addr}");
             axum::serve(listener, app).await.unwrap();
         });
 }
