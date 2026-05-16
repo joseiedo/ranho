@@ -36,8 +36,10 @@ struct AppState {
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
     if state.index.is_some() {
+        eprintln!("[ready] 200 OK");
         StatusCode::OK
     } else {
+        eprintln!("[ready] 503 index not loaded");
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
@@ -46,12 +48,16 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     const JSON: [(header::HeaderName, &str); 1] = [(header::CONTENT_TYPE, "application/json")];
 
     let Some(index) = &state.index else {
+        eprintln!("[fraud-score] index not loaded, returning fallback");
         return (JSON, FRAUD_RESPONSES[0]);
     };
 
     let payload = match serde_json::from_slice(&body) {
         Ok(p) => p,
-        Err(_) => return (JSON, FRAUD_RESPONSES[0]),
+        Err(e) => {
+            eprintln!("[fraud-score] parse error: {e} body={:?}", String::from_utf8_lossy(&body));
+            return (JSON, FRAUD_RESPONSES[0]);
+        }
     };
 
     let vector = state.vectorizer.vectorize(&payload);
