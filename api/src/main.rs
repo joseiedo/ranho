@@ -91,11 +91,11 @@ fn main() {
         }
     };
 
-    if let Some(ref idx) = index {
-        eprintln!("warming up...");
-        idx.warmup();
-        eprintln!("warmup done");
-    }
+    // if let Some(ref idx) = index {
+    //     eprintln!("warming up...");
+    //     idx.warmup();
+    //     eprintln!("warmup done");
+    // }
 
     let vectorizer = Vectorizer::new(mcc_risk);
     let state = Arc::new(AppState { vectorizer, index });
