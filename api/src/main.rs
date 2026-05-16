@@ -99,9 +99,11 @@ fn main() {
                 .route("/fraud-score", post(fraud_score))
                 .with_state(state);
 
-            let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+            let socket_path = std::env::var("SOCKET_PATH")
+                .unwrap_or_else(|_| "/tmp/api.sock".to_string());
 
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             axum::serve(listener, app).await.unwrap();
         });
 }

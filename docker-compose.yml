@@ -1,29 +1,27 @@
 x-api: &api
   image: rinha-2026:local
-  environment:
-    INDEX_PATH: /app/resources/index.bin
   ulimits:
     nofile: 65535
+  volumes:
+    - sockets:/sockets
   deploy:
     resources:
       limits:
         cpus: "0.40"
         memory: "160MB"
-  networks:
-    - rinha
 
 services:
   api1:
     <<: *api
     environment:
       INDEX_PATH: /app/resources/index.bin
-      LISTEN_ADDR: "0.0.0.0:3000"
+      SOCKET_PATH: /sockets/api1.sock
 
   api2:
     <<: *api
     environment:
       INDEX_PATH: /app/resources/index.bin
-      LISTEN_ADDR: "0.0.0.0:3000"
+      SOCKET_PATH: /sockets/api2.sock
 
   nginx:
     image: nginx:alpine
@@ -31,6 +29,7 @@ services:
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - sockets:/sockets
     depends_on:
       - api1
       - api2
@@ -39,8 +38,10 @@ services:
         limits:
           cpus: "0.2"
           memory: "30MB"
-    networks:
-      - rinha
 
-networks:
-  rinha:
+volumes:
+  sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
