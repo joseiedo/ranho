@@ -338,7 +338,6 @@ impl SearchIndex {
 // AVX2 cluster scan — called only from search_avx2 which already holds the target_feature.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
 unsafe fn scan_avx2(
     q_padded: &[i16; 16],
     vectors: &[u8],
@@ -395,7 +394,6 @@ unsafe fn scan_avx2(
 //   final i64 sum: ≤ 4 × 1_600_000_000 = 6_400_000_000 < i64::MAX ✓
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
 unsafe fn dist_avx2(q_padded: &[i16; 16], record: &[u8]) -> i64 {
     use std::arch::x86_64::*;
 
