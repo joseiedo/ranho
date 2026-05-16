@@ -15,8 +15,7 @@ use axum::{
 };
 
 use bytes::Bytes;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use hyper_util::rt::TokioIo;
 use std::{collections::HashMap, sync::Arc};
 use tower_service::Service;
 
@@ -109,7 +108,7 @@ fn main() {
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777)).unwrap();
-            let builder = Builder::new(TokioExecutor::new());
+            let builder = hyper::server::conn::http1::Builder::new();
 
             loop {
                 let (stream, _) = listener.accept().await.unwrap();

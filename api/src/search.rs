@@ -8,7 +8,7 @@ const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
 const NPROBE_FAST: usize = 8;
-const NPROBE_SLOW: usize = 64;
+const NPROBE_SLOW: usize = 48;
 
 pub struct SearchIndex {
     mmap: Mmap,
@@ -24,6 +24,12 @@ impl SearchIndex {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file) }?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+            let _ = mmap.advise(memmap2::Advice::Random);
+        }
 
         if mmap.len() < HEADER_SIZE {
             return Err(std::io::Error::new(
@@ -104,6 +110,9 @@ impl SearchIndex {
             }
             let _ = self.search(&q);
         }
+
+        #[cfg(target_os = "linux")]
+        let _ = self.mmap.lock();
     }
 
     pub fn search(&self, query: &[i16; DIMS]) -> [Label; K] {
@@ -130,7 +139,79 @@ impl SearchIndex {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn search_avx2(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl_inner(query_f32, query)
+        // Zero-pad query to 16 i16s. Record bytes 28-31 are zero (preprocessor padding),
+        // so positions 14-15 contribute 0 to the distance in both sides.
+        let mut q_padded = [0i16; 16];
+        q_padded[..DIMS].copy_from_slice(query);
+
+        let vectors = &self.mmap[self.data_byte..self.labels_byte];
+        let labels = &self.mmap[self.labels_byte..];
+
+        let nprobe_slow = NPROBE_SLOW.min(self.k_clusters);
+        let nprobe_fast = NPROBE_FAST.min(nprobe_slow);
+        let mut best = [(u32::MAX, 0usize); NPROBE_SLOW];
+
+        // Centroid search: float arithmetic auto-vectorizes cleanly with avx2 target_feature.
+        for (ci, c) in self.centroids.iter().enumerate() {
+            let mut d = 0.0f32;
+            for i in 0..DIMS {
+                let diff = query_f32[i] - c[i];
+                d += diff * diff;
+            }
+            let db = d.to_bits();
+            if db < best[nprobe_slow - 1].0 {
+                best[nprobe_slow - 1] = (db, ci);
+                let mut i = nprobe_slow - 1;
+                while i > 0 && best[i].0 < best[i - 1].0 {
+                    best.swap(i, i - 1);
+                    i -= 1;
+                }
+            }
+        }
+
+        let mut probed = [0usize; NPROBE_SLOW];
+        for (slot, &(_, ci)) in probed[..nprobe_slow]
+            .iter_mut()
+            .zip(best[..nprobe_slow].iter())
+        {
+            *slot = ci;
+        }
+
+        let mut top = [(i64::MAX, 0u8); K];
+        let mut top_len = 0usize;
+        let mut worst_dist = i64::MAX;
+        let mut worst_pos = 0usize;
+
+        scan_avx2(
+            &q_padded,
+            vectors,
+            labels,
+            &self.offsets,
+            &probed[..nprobe_fast],
+            &mut top,
+            &mut top_len,
+            &mut worst_dist,
+            &mut worst_pos,
+        );
+
+        let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
+        if top_len >= K && (fraud_count == 0 || fraud_count == 1 || fraud_count == 5) {
+            return labels_to_result(&top);
+        }
+
+        scan_avx2(
+            &q_padded,
+            vectors,
+            labels,
+            &self.offsets,
+            &probed[nprobe_fast..nprobe_slow],
+            &mut top,
+            &mut top_len,
+            &mut worst_dist,
+            &mut worst_pos,
+        );
+
+        labels_to_result(&top)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -252,6 +333,86 @@ impl SearchIndex {
             }
         }
     }
+}
+
+// AVX2 cluster scan — called only from search_avx2 which already holds the target_feature.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(always)]
+unsafe fn scan_avx2(
+    q_padded: &[i16; 16],
+    vectors: &[u8],
+    labels: &[u8],
+    offsets: &[u32],
+    clusters: &[usize],
+    top: &mut [(i64, u8); K],
+    top_len: &mut usize,
+    worst_dist: &mut i64,
+    worst_pos: &mut usize,
+) {
+    for &ci in clusters {
+        let start = offsets[ci] as usize;
+        let end = offsets[ci + 1] as usize;
+
+        for j in start..end {
+            let base = j * STRIDE;
+            let dist = dist_avx2(q_padded, vectors.get_unchecked(base..base + STRIDE));
+
+            if *top_len < K {
+                top[*top_len] = (dist, *labels.get_unchecked(j));
+                *top_len += 1;
+                if *top_len == K {
+                    *worst_pos = 0;
+                    for i in 1..K {
+                        if top[i].0 > top[*worst_pos].0 {
+                            *worst_pos = i;
+                        }
+                    }
+                    *worst_dist = top[*worst_pos].0;
+                }
+            } else if dist < *worst_dist {
+                top[*worst_pos] = (dist, *labels.get_unchecked(j));
+                *worst_pos = 0;
+                for i in 1..K {
+                    if top[i].0 > top[*worst_pos].0 {
+                        *worst_pos = i;
+                    }
+                }
+                *worst_dist = top[*worst_pos].0;
+            }
+        }
+    }
+}
+
+// One AVX2 register (256-bit) holds exactly STRIDE=32 bytes = 16 i16s.
+// Dimensions 14-15 are zero in both q_padded and the record padding bytes,
+// so they contribute 0 to the sum.
+//
+// Overflow analysis:
+//   max |diff| per dim = 20_000 (range [-10_000, 10_000])
+//   madd output per pair: diff² + diff² ≤ 2 × 20_000² = 800_000_000 < i32::MAX ✓
+//   after one hadd: ≤ 1_600_000_000 < i32::MAX ✓  (safe to extract as i32)
+//   final i64 sum: ≤ 4 × 1_600_000_000 = 6_400_000_000 < i64::MAX ✓
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(always)]
+unsafe fn dist_avx2(q_padded: &[i16; 16], record: &[u8]) -> i64 {
+    use std::arch::x86_64::*;
+
+    let q = _mm256_loadu_si256(q_padded.as_ptr() as *const __m256i);
+    let r = _mm256_loadu_si256(record.as_ptr() as *const __m256i);
+    let diff = _mm256_sub_epi16(q, r);
+    // vpmaddwd: multiplies adjacent i16 pairs and sums into i32 → 8 i32 results
+    let sq = _mm256_madd_epi16(diff, diff);
+    // One hadd collapses 8 i32 → 4 i32 partial sums (each ≤ 1.6B, safe in i32)
+    let h = _mm256_hadd_epi32(sq, sq);
+    let lo = _mm256_castsi256_si128(h);
+    let hi = _mm256_extracti128_si256(h, 1);
+
+    _mm_cvtsi128_si32(lo) as i64
+        + _mm_extract_epi32::<1>(lo) as i64
+        + _mm_cvtsi128_si32(hi) as i64
+        + _mm_extract_epi32::<1>(hi) as i64
 }
 
 #[inline(always)]
@@ -402,5 +563,4 @@ mod tests {
         let diff = quantize(-1.0) as i64;
         assert_eq!(dist, diff * diff);
     }
-
 }
