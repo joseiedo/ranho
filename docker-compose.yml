@@ -1,5 +1,6 @@
 x-api: &api
   image: ghcr.io/joseiedo/rinha-de-backend-2026:v0.0.10
+  pull_policy: always
   environment:
     INDEX_PATH: /app/resources/index.bin
   deploy:
