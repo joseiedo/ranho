@@ -14,7 +14,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 static FRAUD_RESPONSES: [&[u8]; 6] = [
     br#"{"approved":true,"fraud_score":0.0}"#,
@@ -28,14 +28,15 @@ static FRAUD_RESPONSES: [&[u8]; 6] = [
 struct AppState {
     vectorizer: Vectorizer,
     index: Option<SearchIndex>,
+    warmed_up: AtomicBool,
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.index.is_some() {
+    if state.warmed_up.load(Ordering::Relaxed) {
         eprintln!("[ready] 200 OK");
         StatusCode::OK
     } else {
-        eprintln!("[ready] 503 index not loaded");
+        eprintln!("[ready] 503 warming up");
         StatusCode::SERVICE_UNAVAILABLE
     }
 }
@@ -89,9 +90,6 @@ async fn main() {
     let index = match SearchIndex::open(&index_path) {
         Ok(idx) => {
             eprintln!("index loaded: {} vectors", idx.count());
-            eprintln!("warming up...");
-            idx.warmup();
-            eprintln!("warmup done");
             Some(idx)
         }
         Err(e) => {
@@ -102,7 +100,17 @@ async fn main() {
 
     let vectorizer = Vectorizer::new(mcc_risk);
 
-    let state = Arc::new(AppState { vectorizer, index });
+    let state = Arc::new(AppState { vectorizer, index, warmed_up: AtomicBool::new(false) });
+
+    if state.index.is_some() {
+        let state2 = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            eprintln!("warming up...");
+            state2.index.as_ref().unwrap().warmup();
+            state2.warmed_up.store(true, Ordering::Relaxed);
+            eprintln!("warmup done");
+        });
+    }
 
     let app = Router::new()
         .route("/ready", get(ready))
