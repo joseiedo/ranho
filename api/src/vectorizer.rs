@@ -2,7 +2,7 @@ use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 
 use crate::normalization::{
-    clamp01, DEFAULT_MCC_RISK, DOW_LUT, HOUR_LUT, AMOUNT_VS_AVG_RATIO, MAX_AMOUNT,
+    clamp01, AMOUNT_VS_AVG_RATIO, DEFAULT_MCC_RISK, DOW_LUT, HOUR_LUT, MAX_AMOUNT,
     MAX_INSTALLMENTS, MAX_KM, MAX_MERCHANT_AVG_AMOUNT, MAX_MINUTES, MAX_TX_COUNT_24H,
 };
 use crate::types::TransactionPayload;
@@ -16,6 +16,7 @@ impl Vectorizer {
         Self { mcc_risk }
     }
 
+    // https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/REGRAS_DE_DETECCAO.md#as-14-dimens%C3%B5es-do-vetor
     pub fn vectorize(&self, payload: &TransactionPayload) -> [f32; 14] {
         let tx = &payload.transaction;
         let customer = &payload.customer;
@@ -42,7 +43,10 @@ impl Vectorizer {
             1.0
         };
 
-        let mcc_risk = *self.mcc_risk.get(&merchant.mcc).unwrap_or(&DEFAULT_MCC_RISK);
+        let mcc_risk = *self
+            .mcc_risk
+            .get(&merchant.mcc)
+            .unwrap_or(&DEFAULT_MCC_RISK);
 
         [
             clamp01(tx.amount / MAX_AMOUNT),
@@ -62,6 +66,10 @@ impl Vectorizer {
         ]
     }
 
+    // Quantize means converting the 14-dimensional float vector into a 14-dimensional integer
+    // vector.
+    // This makes the vector smaller and faster to compare, and works well for our case because we
+    // only need enough precision to distinguish between different transactions, but we don't need the full precision of a float.
     pub fn quantize(vector: &[f32; 14]) -> [i16; 14] {
         let mut out = [0i16; 14];
         for (i, &v) in vector.iter().enumerate() {
@@ -76,7 +84,9 @@ impl Vectorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Customer, LastTransaction, Merchant, Terminal, Transaction, TransactionPayload};
+    use crate::types::{
+        Customer, LastTransaction, Merchant, Terminal, Transaction, TransactionPayload,
+    };
 
     fn mcc_map(entries: &[(&str, f32)]) -> HashMap<String, f32> {
         entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()

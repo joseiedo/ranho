@@ -38,6 +38,7 @@ async fn ready() -> StatusCode {
     StatusCode::OK
 }
 
+// https://github.com/zanfranceschi/rinha-de-backend-2026/blob/main/docs/br/REGRAS_DE_DETECCAO.md
 async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
     const JSON: [(header::HeaderName, &str); 1] = [(header::CONTENT_TYPE, "application/json")];
 
@@ -53,8 +54,12 @@ async fn fraud_score(State(state): State<Arc<AppState>>, body: Bytes) -> impl In
     };
 
     let vector = state.vectorizer.vectorize(&payload);
+
+    // IVF-PQ approach: search with original vector, but use quantized version for distance calculations.
+    // https://docs.rapids.ai/api/cuvs/nightly/neighbors/ivfpq/#ivf-pq
     let quantized = Vectorizer::quantize(&vector);
     let neighbors = index.search_with_vector(&vector, &quantized);
+
     let fraud_count = neighbors.iter().filter(|&&l| l == Label::Fraud).count();
 
     (JSON, FRAUD_RESPONSES[fraud_count])
@@ -102,8 +107,8 @@ fn main() {
                 .route("/fraud-score", post(fraud_score))
                 .with_state(state);
 
-            let socket_path = std::env::var("SOCKET_PATH")
-                .unwrap_or_else(|_| "/tmp/api.sock".to_string());
+            let socket_path =
+                std::env::var("SOCKET_PATH").unwrap_or_else(|_| "/tmp/api.sock".to_string());
 
             let _ = std::fs::remove_file(&socket_path);
             let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();

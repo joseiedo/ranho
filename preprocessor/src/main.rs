@@ -1,3 +1,7 @@
+// This processor uses the references.json.gz file as a source.
+// - Uses k-means++ to find centroids
+// -
+
 use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -49,6 +53,7 @@ fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
     best
 }
 
+// k-means++ initialization: https://en.wikipedia.org/wiki/K-means%2B%2B
 fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Vec<f32> {
     let mut flat = vec![0.0f32; nlist * DIMS];
     let mut dmin = vec![f32::MAX; sample.len()];
@@ -134,12 +139,23 @@ fn main() {
     let mut sample_assignments = vec![0u32; sample_size];
     let nthreads = rayon::current_num_threads();
 
+    // Now we do the k-means iterations. Each iteration consists of two steps:
+    // 1. Assign each sample vector to the nearest centroid (parallelized).
+    // 2. Update each centroid to be the mean of its assigned vectors (parallelized with reduction).
+    // We track how many vectors changed their assignment, and stop early if it reaches zero.
+    // This is the lloyd's algorithm variant of k-means.
+    // https://en.wikipedia.org/wiki/K-means
+    // Run Lloyd's k-means refinement loop over the sampled vectors.
+    // Each iteration assigns vectors to the nearest centroid, then recomputes
+    // each centroid as the mean of its assigned vectors.
     for iter in 0..KMEANS_ITERS {
+        // Step 1: assign each sampled vector to its nearest centroid.
         let new_assignments: Vec<u32> = sample
             .par_iter()
             .map(|&si| nearest(&vectors[si], &centroids_flat, nlist_actual))
             .collect();
 
+        // Count assignment changes so we can stop early once the clustering converges.
         let changed = new_assignments
             .iter()
             .zip(sample_assignments.iter())
@@ -147,6 +163,7 @@ fn main() {
             .count();
         sample_assignments = new_assignments;
 
+        // Step 2a: accumulate per-centroid sums and counts in thread-local buffers.
         let chunk = (sample_size + nthreads - 1) / nthreads;
         let thread_results: Vec<(Vec<f64>, Vec<u32>)> = (0..nthreads)
             .into_par_iter()
@@ -168,6 +185,7 @@ fn main() {
             })
             .collect();
 
+        // Step 2b: reduce the thread-local accumulators into global sums and counts.
         let mut global_sums = vec![0.0f64; nlist_actual * DIMS];
         let mut global_counts = vec![0u32; nlist_actual];
         for (sums, counts) in &thread_results {
@@ -179,6 +197,7 @@ fn main() {
             }
         }
 
+        // Step 2c: divide sums by counts to update each centroid to its mean.
         for ci in 0..nlist_actual {
             if global_counts[ci] > 0 {
                 let inv = 1.0 / global_counts[ci] as f64;
@@ -193,6 +212,7 @@ fn main() {
             "  iter {}/{KMEANS_ITERS}: {changed} reassignments",
             iter + 1
         );
+        // No assignment changes means the sampled clustering has converged.
         if changed == 0 {
             break;
         }
