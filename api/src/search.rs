@@ -328,7 +328,6 @@ fn dist_scalar(query: &[i16; DIMS], record: &[u8]) -> i64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
 #[target_feature(enable = "avx2")]
 unsafe fn dist_avx2(query: &[i16; 16], record: &[u8]) -> i64 {
     let q = unsafe { _mm256_loadu_si256(query.as_ptr().cast::<__m256i>()) };
