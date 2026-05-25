@@ -42,11 +42,18 @@ pub struct SearchIndex {
     k_clusters: usize,
     n: usize,
     centroids: Vec<[f32; DIMS]>,
-    quantized_centroids: Vec<[f32; DIMS]>,
+    quantized_centroids: Vec<[i16; PADDED_DIMS]>,
     offsets: Vec<u32>,
     radii: Vec<f32>,
     data_byte: usize,
     labels_byte: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClusterVisit {
+    ci: usize,
+    exact_sq: i64,
+    lower_bound_sq: f32,
 }
 
 impl SearchIndex {
@@ -121,9 +128,11 @@ impl SearchIndex {
         let quantized_centroids = centroids
             .iter()
             .map(|centroid| {
-                let mut q = [0.0f32; DIMS];
+                let mut q = [0i16; PADDED_DIMS];
                 for d in 0..DIMS {
-                    q[d] = centroid[d] * QUANT_SCALE;
+                    q[d] = (centroid[d] * QUANT_SCALE)
+                        .round()
+                        .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 }
                 q
             })
@@ -254,7 +263,7 @@ impl SearchIndex {
             query_f32,
             query,
             centroid_distances_top_scalar,
-            centroid_distances_all_scalar,
+            centroid_visits_all_scalar,
             dist_scalar_record,
         )
     }
@@ -270,22 +279,22 @@ impl SearchIndex {
             query_f32,
             query,
             centroid_distances_top_avx2,
-            centroid_distances_all_avx2,
+            centroid_visits_all_avx2,
             dist_avx2_record,
         )
     }
 
-    fn search_impl_inner<TopCentroidFn, AllCentroidFn, DistFn>(
+    fn search_impl_inner<TopCentroidFn, ExactVisitFn, DistFn>(
         &self,
         query_f32: &[f32; DIMS],
         query: &[i16; DIMS],
         top_centroid_fn: TopCentroidFn,
-        all_centroid_fn: AllCentroidFn,
+        exact_visit_fn: ExactVisitFn,
         dist_fn: DistFn,
     ) -> ([Label; K], SearchMetrics)
     where
         TopCentroidFn: Fn(&[[f32; DIMS]], &[f32; DIMS], usize) -> [(u32, usize); NPROBE_SLOW],
-        AllCentroidFn: Fn(&[[f32; DIMS]], &[f32; DIMS]) -> Vec<(u32, usize)>,
+        ExactVisitFn: Fn(&[[i16; PADDED_DIMS]], &[f32], &[i16; DIMS]) -> Vec<ClusterVisit>,
         DistFn: Fn(&[i16; DIMS], &[u8], usize) -> i64,
     {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
@@ -294,7 +303,7 @@ impl SearchIndex {
 
         if self.format == IndexFormat::V4 {
             let start = Instant::now();
-            let ordered = all_centroid_fn(&self.centroids, query_f32);
+            let ordered = exact_visit_fn(&self.quantized_centroids, &self.radii, query);
             metrics.centroid_time_ns = start.elapsed().as_nanos();
 
             let mut top = [(i64::MAX, 0u8); K];
@@ -303,21 +312,31 @@ impl SearchIndex {
             let mut worst_pos = 0usize;
 
             let start = Instant::now();
-            for &(bits, ci) in &ordered {
-                let centroid_sq = f32::from_bits(bits);
-                self.scan_clusters(
-                    query,
-                    vectors,
-                    labels,
-                    std::slice::from_ref(&ci),
-                    std::slice::from_ref(&centroid_sq),
-                    &dist_fn,
-                    &mut top,
-                    &mut top_len,
-                    &mut worst_dist,
-                    &mut worst_pos,
-                    &mut metrics,
-                );
+            for visit in &ordered {
+                if top_len >= K && visit.lower_bound_sq > worst_dist as f32 {
+                    metrics.pruned_clusters += 1;
+                    continue;
+                }
+
+                metrics.scanned_clusters += 1;
+                let start_idx = self.offsets[visit.ci] as usize;
+                let end_idx = self.offsets[visit.ci + 1] as usize;
+
+                for j in start_idx..end_idx {
+                    let dist = dist_fn(query, vectors, j);
+                    metrics.scanned_vectors += 1;
+
+                    if top_len < K {
+                        top[top_len] = (dist, labels[j]);
+                        top_len += 1;
+                        if top_len == K {
+                            recompute_worst(&top, &mut worst_dist, &mut worst_pos);
+                        }
+                    } else if dist < worst_dist {
+                        top[worst_pos] = (dist, labels[j]);
+                        recompute_worst(&top, &mut worst_dist, &mut worst_pos);
+                    }
+                }
             }
             metrics.scan_time_ns = start.elapsed().as_nanos();
 
@@ -425,7 +444,7 @@ impl SearchIndex {
 
     fn can_prune_cluster(
         &self,
-        query: &[i16; DIMS],
+        _query: &[i16; DIMS],
         ci: usize,
         centroid_distance_sq: f32,
         worst_dist: i64,
@@ -439,14 +458,7 @@ impl SearchIndex {
             return false;
         }
 
-        let mut exact_centroid_distance_sq = 0.0f32;
-        let quantized_centroid = &self.quantized_centroids[ci];
-        for d in 0..DIMS {
-            let diff = query[d] as f32 - quantized_centroid[d];
-            exact_centroid_distance_sq += diff * diff;
-        }
-
-        let lower_bound = (exact_centroid_distance_sq.sqrt() - radius).max(0.0);
+        let lower_bound = (centroid_distance_sq.sqrt() * QUANT_SCALE - radius).max(0.0);
         let lower_bound_sq = lower_bound * lower_bound;
         lower_bound_sq > worst_dist as f32 && centroid_distance_sq.is_finite()
     }
@@ -530,20 +542,26 @@ fn centroid_distances_top_scalar(
 }
 
 #[inline(always)]
-fn centroid_distances_all_scalar(
-    centroids: &[[f32; DIMS]],
-    query_f32: &[f32; DIMS],
-) -> Vec<(u32, usize)> {
+fn centroid_visits_all_scalar(
+    centroids: &[[i16; PADDED_DIMS]],
+    radii: &[f32],
+    query: &[i16; DIMS],
+) -> Vec<ClusterVisit> {
     let mut ordered = Vec::with_capacity(centroids.len());
     for (ci, centroid) in centroids.iter().enumerate() {
-        let mut d = 0.0f32;
-        for i in 0..DIMS {
-            let diff = query_f32[i] - centroid[i];
-            d += diff * diff;
+        let mut exact_sq = 0i64;
+        for d in 0..DIMS {
+            let diff = query[d] as i64 - centroid[d] as i64;
+            exact_sq += diff * diff;
         }
-        ordered.push((d.to_bits(), ci));
+        let lower_bound = ((exact_sq as f32).sqrt() - radii[ci]).max(0.0);
+        ordered.push(ClusterVisit {
+            ci,
+            exact_sq,
+            lower_bound_sq: lower_bound * lower_bound,
+        });
     }
-    ordered.sort_unstable_by_key(|&(bits, _)| bits);
+    ordered.sort_unstable_by_key(|visit| visit.exact_sq);
     ordered
 }
 
@@ -602,34 +620,45 @@ unsafe fn centroid_distances_top_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn centroid_distances_all_avx2(
-    centroids: &[[f32; DIMS]],
-    query_f32: &[f32; DIMS],
-) -> Vec<(u32, usize)> {
+unsafe fn centroid_visits_all_avx2(
+    centroids: &[[i16; PADDED_DIMS]],
+    radii: &[f32],
+    query: &[i16; DIMS],
+) -> Vec<ClusterVisit> {
     use std::arch::x86_64::*;
 
     let mut ordered = Vec::with_capacity(centroids.len());
-    let q0 = _mm256_loadu_ps(query_f32.as_ptr());
-    let q1 = _mm_loadu_ps(query_f32[8..].as_ptr());
+    let mut padded_query = [0i16; PADDED_DIMS];
+    padded_query[..DIMS].copy_from_slice(query);
+    let q = _mm256_loadu_si256(padded_query.as_ptr() as *const __m256i);
+    let q_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q));
+    let q_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q, 1));
 
     for (ci, centroid) in centroids.iter().enumerate() {
-        let c0 = _mm256_loadu_ps(centroid.as_ptr());
-        let c1 = _mm_loadu_ps(centroid[8..].as_ptr());
+        let c = _mm256_loadu_si256(centroid.as_ptr() as *const __m256i);
+        let c_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(c));
+        let c_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(c, 1));
 
-        let diff0 = _mm256_sub_ps(q0, c0);
-        let diff1 = _mm_sub_ps(q1, c1);
-        let sq0 = _mm256_mul_ps(diff0, diff0);
-        let sq1 = _mm_mul_ps(diff1, diff1);
+        let d_lo = _mm256_sub_epi32(q_lo, c_lo);
+        let d_hi = _mm256_sub_epi32(q_hi, c_hi);
+        let sq_lo = _mm256_mullo_epi32(d_lo, d_lo);
+        let sq_hi = _mm256_mullo_epi32(d_hi, d_hi);
 
-        let mut sum0 = [0.0f32; 8];
-        let mut sum1 = [0.0f32; 4];
-        _mm256_storeu_ps(sum0.as_mut_ptr(), sq0);
-        _mm_storeu_ps(sum1.as_mut_ptr(), sq1);
-
-        ordered.push(((sum0.iter().sum::<f32>() + sum1.iter().sum::<f32>()).to_bits(), ci));
+        let mut acc_lo = [0i32; 8];
+        let mut acc_hi = [0i32; 8];
+        _mm256_storeu_si256(acc_lo.as_mut_ptr() as *mut __m256i, sq_lo);
+        _mm256_storeu_si256(acc_hi.as_mut_ptr() as *mut __m256i, sq_hi);
+        let exact_sq =
+            acc_lo.iter().map(|&x| x as i64).sum::<i64>() + acc_hi.iter().map(|&x| x as i64).sum::<i64>();
+        let lower_bound = ((exact_sq as f32).sqrt() - radii[ci]).max(0.0);
+        ordered.push(ClusterVisit {
+            ci,
+            exact_sq,
+            lower_bound_sq: lower_bound * lower_bound,
+        });
     }
 
-    ordered.sort_unstable_by_key(|&(bits, _)| bits);
+    ordered.sort_unstable_by_key(|visit| visit.exact_sq);
     ordered
 }
 
