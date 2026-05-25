@@ -278,9 +278,11 @@ impl SearchIndex {
         self.search_impl_inner(
             query_f32,
             query,
-            centroid_distances_top_avx2,
-            centroid_visits_all_avx2,
-            dist_avx2_record,
+            |centroids, query_f32, nprobe_slow| {
+                centroid_distances_top_avx2(centroids, query_f32, nprobe_slow)
+            },
+            |centroids, radii, query| centroid_visits_all_avx2(centroids, radii, query),
+            |query, records, idx| dist_avx2_record(query, records, idx),
         )
     }
 
