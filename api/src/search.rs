@@ -250,7 +250,13 @@ impl SearchIndex {
         query_f32: &[f32; DIMS],
         query: &[i16; DIMS],
     ) -> ([Label; K], SearchMetrics) {
-        self.search_impl_inner(query_f32, query, centroid_distances_scalar, dist_scalar_record)
+        self.search_impl_inner(
+            query_f32,
+            query,
+            centroid_distances_top_scalar,
+            centroid_distances_all_scalar,
+            dist_scalar_record,
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -260,29 +266,69 @@ impl SearchIndex {
         query_f32: &[f32; DIMS],
         query: &[i16; DIMS],
     ) -> ([Label; K], SearchMetrics) {
-        self.search_impl_inner(query_f32, query, centroid_distances_avx2, dist_avx2_record)
+        self.search_impl_inner(
+            query_f32,
+            query,
+            centroid_distances_top_avx2,
+            centroid_distances_all_avx2,
+            dist_avx2_record,
+        )
     }
 
-    fn search_impl_inner<CentroidFn, DistFn>(
+    fn search_impl_inner<TopCentroidFn, AllCentroidFn, DistFn>(
         &self,
         query_f32: &[f32; DIMS],
         query: &[i16; DIMS],
-        centroid_fn: CentroidFn,
+        top_centroid_fn: TopCentroidFn,
+        all_centroid_fn: AllCentroidFn,
         dist_fn: DistFn,
     ) -> ([Label; K], SearchMetrics)
     where
-        CentroidFn: Fn(&[[f32; DIMS]], &[f32; DIMS], usize) -> [(u32, usize); NPROBE_SLOW],
+        TopCentroidFn: Fn(&[[f32; DIMS]], &[f32; DIMS], usize) -> [(u32, usize); NPROBE_SLOW],
+        AllCentroidFn: Fn(&[[f32; DIMS]], &[f32; DIMS]) -> Vec<(u32, usize)>,
         DistFn: Fn(&[i16; DIMS], &[u8], usize) -> i64,
     {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
         let labels = &self.mmap[self.labels_byte..];
         let mut metrics = SearchMetrics::default();
 
+        if self.format == IndexFormat::V4 {
+            let start = Instant::now();
+            let ordered = all_centroid_fn(&self.centroids, query_f32);
+            metrics.centroid_time_ns = start.elapsed().as_nanos();
+
+            let mut top = [(i64::MAX, 0u8); K];
+            let mut top_len = 0usize;
+            let mut worst_dist = i64::MAX;
+            let mut worst_pos = 0usize;
+
+            let start = Instant::now();
+            for &(bits, ci) in &ordered {
+                let centroid_sq = f32::from_bits(bits);
+                self.scan_clusters(
+                    query,
+                    vectors,
+                    labels,
+                    std::slice::from_ref(&ci),
+                    std::slice::from_ref(&centroid_sq),
+                    &dist_fn,
+                    &mut top,
+                    &mut top_len,
+                    &mut worst_dist,
+                    &mut worst_pos,
+                    &mut metrics,
+                );
+            }
+            metrics.scan_time_ns = start.elapsed().as_nanos();
+
+            return (labels_to_result(&top), metrics);
+        }
+
         let nprobe_slow = NPROBE_SLOW.min(self.k_clusters);
         let nprobe_fast = NPROBE_FAST.min(nprobe_slow);
 
         let start = Instant::now();
-        let best = centroid_fn(&self.centroids, query_f32, nprobe_slow);
+        let best = top_centroid_fn(&self.centroids, query_f32, nprobe_slow);
         metrics.centroid_time_ns = start.elapsed().as_nanos();
 
         let mut probed = [0usize; NPROBE_SLOW];
@@ -456,7 +502,7 @@ fn load_record(records: &[u8], idx: usize) -> [i16; PADDED_DIMS] {
 }
 
 #[inline(always)]
-fn centroid_distances_scalar(
+fn centroid_distances_top_scalar(
     centroids: &[[f32; DIMS]],
     query_f32: &[f32; DIMS],
     nprobe_slow: usize,
@@ -484,6 +530,24 @@ fn centroid_distances_scalar(
 }
 
 #[inline(always)]
+fn centroid_distances_all_scalar(
+    centroids: &[[f32; DIMS]],
+    query_f32: &[f32; DIMS],
+) -> Vec<(u32, usize)> {
+    let mut ordered = Vec::with_capacity(centroids.len());
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let mut d = 0.0f32;
+        for i in 0..DIMS {
+            let diff = query_f32[i] - centroid[i];
+            d += diff * diff;
+        }
+        ordered.push((d.to_bits(), ci));
+    }
+    ordered.sort_unstable_by_key(|&(bits, _)| bits);
+    ordered
+}
+
+#[inline(always)]
 fn dist_scalar_record(query: &[i16; DIMS], records: &[u8], idx: usize) -> i64 {
     let record = load_record(records, idx);
     let mut dist: i64 = 0;
@@ -496,7 +560,7 @@ fn dist_scalar_record(query: &[i16; DIMS], records: &[u8], idx: usize) -> i64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn centroid_distances_avx2(
+unsafe fn centroid_distances_top_avx2(
     centroids: &[[f32; DIMS]],
     query_f32: &[f32; DIMS],
     nprobe_slow: usize,
@@ -534,6 +598,39 @@ unsafe fn centroid_distances_avx2(
     }
 
     best
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn centroid_distances_all_avx2(
+    centroids: &[[f32; DIMS]],
+    query_f32: &[f32; DIMS],
+) -> Vec<(u32, usize)> {
+    use std::arch::x86_64::*;
+
+    let mut ordered = Vec::with_capacity(centroids.len());
+    let q0 = _mm256_loadu_ps(query_f32.as_ptr());
+    let q1 = _mm_loadu_ps(query_f32[8..].as_ptr());
+
+    for (ci, centroid) in centroids.iter().enumerate() {
+        let c0 = _mm256_loadu_ps(centroid.as_ptr());
+        let c1 = _mm_loadu_ps(centroid[8..].as_ptr());
+
+        let diff0 = _mm256_sub_ps(q0, c0);
+        let diff1 = _mm_sub_ps(q1, c1);
+        let sq0 = _mm256_mul_ps(diff0, diff0);
+        let sq1 = _mm_mul_ps(diff1, diff1);
+
+        let mut sum0 = [0.0f32; 8];
+        let mut sum1 = [0.0f32; 4];
+        _mm256_storeu_ps(sum0.as_mut_ptr(), sq0);
+        _mm_storeu_ps(sum1.as_mut_ptr(), sq1);
+
+        ordered.push(((sum0.iter().sum::<f32>() + sum1.iter().sum::<f32>()).to_bits(), ci));
+    }
+
+    ordered.sort_unstable_by_key(|&(bits, _)| bits);
+    ordered
 }
 
 #[cfg(target_arch = "x86_64")]
