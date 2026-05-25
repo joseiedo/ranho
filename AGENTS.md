@@ -25,7 +25,7 @@ RUSTFLAGS="-C target-cpu=haswell" cargo build --release -p api
 
 # Build the IVF index locally
 cargo run --release -p preprocessor -- \
-  ./resources/references.json.gz \
+  ./spec/resources/references.json.gz \
   ./resources/index.bin
 
 # Run the API locally over a Unix socket
@@ -73,16 +73,21 @@ POST /fraud-score
 - `api/src/search.rs` - memory-maps the IVF index, selects centroids, scans candidate vectors, and returns the top-5 labels
 - `api/src/scorer.rs` - score helpers and approval logic
 - `api/src/types.rs` - request and response types plus the `Label` enum
-- `preprocessor/src/main.rs` - parses reference data, runs sampled k-means, assigns all vectors to clusters, and writes the binary index
+- `preprocessor/src/main.rs` - parses reference data, trains quantized IVF centroids, assigns all vectors to clusters, and writes the binary index
 
 ## Important Implementation Details
 
 - Quantization uses `i16` with scale `10_000.0`, not `i8`
-- The IVF file magic is `RINHIVF3`
-- Stored vector stride is 32 bytes: 14 `i16` values plus 4 padding bytes
-- The search path uses a two-phase probe strategy:
-  - fast phase probes up to 8 clusters
-  - slow phase expands up to 64 clusters when the first pass is ambiguous
+- The IVF file magic is `RINHIVF4`
+- Stored centroid stride is 16 lanes: 14 dimensions plus 2 padding lanes
+- The IVF payload layout is:
+  - header: magic, vector count, cluster count, dims, stride
+  - centroid table as `float32`
+  - per-cluster bbox min/max as `i16`
+  - cumulative cluster offsets
+  - cluster-sorted vectors in column-major `i16` layout
+  - cluster-sorted labels
+- The search path probes up to 8 clusters first, prunes with bbox lower bounds, and expands to up to 100 clusters when the partial top-5 remains ambiguous with 2 or 3 fraud neighbors
 - Responses are precomputed static JSON byte slices to avoid per-request serialization
 - If the index fails to open or the request body is invalid, the handler returns the safest fallback response: `{"approved":true,"fraud_score":0.0}`
 - The API intentionally runs on a current-thread Tokio runtime to stay within the challenge resource budget
@@ -90,7 +95,7 @@ POST /fraud-score
 
 ## Data And Runtime Assumptions
 
-- `resources/references.json.gz` must exist before building the Docker image because the image build runs the `preprocessor`
+- `spec/resources/references.json.gz` is the local reference dataset used to rebuild `resources/index.bin`
 - The API expects `resources/index.bin` at runtime unless `INDEX_PATH` overrides it
 - `SOCKET_PATH` defaults to `/tmp/api.sock`
 - `docker-compose.yml` budgets the stack to 1.0 CPU and 350 MB total:
@@ -102,6 +107,7 @@ POST /fraud-score
 
 - Prefer changes that preserve the no-allocation hot path in `api/src/main.rs` and `api/src/search.rs`
 - Treat `api/src/search.rs` as performance-sensitive code; avoid unnecessary bounds checks, allocations, or format conversions in the request path
+- Keep `preprocessor/src/main.rs` and `api/src/search.rs` in lockstep when changing centroid stride, bbox encoding, offsets, or column-major data layout
 - Keep fallback behavior stable unless the user explicitly wants to change challenge strategy
 - If you change vector semantics, update both API tests and preprocessor assumptions
 - If you change the binary index layout, update both `preprocessor/src/main.rs` and `api/src/search.rs` together
