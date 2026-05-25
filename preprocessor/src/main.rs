@@ -11,7 +11,7 @@ const PADDED_DIMS: usize = 16;
 const STRIDE: usize = PADDED_DIMS * 2;
 const DEFAULT_NLIST: usize = 4096;
 const KMEANS_ITERS: usize = 25;
-const DEFAULT_SAMPLE_SIZE: usize = 60_000;
+const DEFAULT_SAMPLE_SIZE: usize = 120_000;
 const QUANT_SCALE: f32 = 10_000.0;
 const SAMPLE_SEED: u64 = 0x4d595df4d0f33173;
 
