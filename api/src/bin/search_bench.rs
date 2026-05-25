@@ -129,16 +129,14 @@ fn load_bench_data(
     query_limit: usize,
 ) -> LoadedBenchData {
     let mcc_risk: HashMap<String, f32> = serde_json::from_reader(
-        File::open(mcc_risk_path).unwrap_or_else(|err| {
-            panic!("failed to open {}: {err}", mcc_risk_path.display())
-        }),
+        File::open(mcc_risk_path)
+            .unwrap_or_else(|err| panic!("failed to open {}: {err}", mcc_risk_path.display())),
     )
     .unwrap_or_else(|err| panic!("failed to parse {}: {err}", mcc_risk_path.display()));
 
     let test_data: TestDataFile = serde_json::from_reader(
-        File::open(test_data_path).unwrap_or_else(|err| {
-            panic!("failed to open {}: {err}", test_data_path.display())
-        }),
+        File::open(test_data_path)
+            .unwrap_or_else(|err| panic!("failed to open {}: {err}", test_data_path.display())),
     )
     .unwrap_or_else(|err| panic!("failed to parse {}: {err}", test_data_path.display()));
 
@@ -152,8 +150,12 @@ fn load_bench_data(
         queries.push(Query { vector, quantized });
     }
 
-    let index = SearchIndex::open(index_path.to_str().expect("index path should be valid UTF-8"))
-        .unwrap_or_else(|err| panic!("failed to open {}: {err}", index_path.display()));
+    let index = SearchIndex::open(
+        index_path
+            .to_str()
+            .expect("index path should be valid UTF-8"),
+    )
+    .unwrap_or_else(|err| panic!("failed to open {}: {err}", index_path.display()));
 
     LoadedBenchData { index, queries }
 }

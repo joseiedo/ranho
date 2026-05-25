@@ -29,7 +29,13 @@ mod tests {
 
     #[test]
     fn three_fraud_is_denied() {
-        let neighbors = [Label::Fraud, Label::Fraud, Label::Fraud, Label::Legit, Label::Legit];
+        let neighbors = [
+            Label::Fraud,
+            Label::Fraud,
+            Label::Fraud,
+            Label::Legit,
+            Label::Legit,
+        ];
         let (score, approved) = score(neighbors);
         assert_eq!(score, 0.6);
         assert!(!approved);
@@ -37,7 +43,13 @@ mod tests {
 
     #[test]
     fn two_fraud_is_approved() {
-        let neighbors = [Label::Fraud, Label::Fraud, Label::Legit, Label::Legit, Label::Legit];
+        let neighbors = [
+            Label::Fraud,
+            Label::Fraud,
+            Label::Legit,
+            Label::Legit,
+            Label::Legit,
+        ];
         let (score, approved) = score(neighbors);
         assert_eq!(score, 0.4);
         assert!(approved);

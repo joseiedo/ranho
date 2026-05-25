@@ -23,7 +23,7 @@ RUN cargo build --release -p preprocessor
 RUN RUSTFLAGS="${API_RUSTFLAGS}" cargo build --release -p api
 
 # references.json.gz must be present in the build context under resources/
-COPY resources/references.json.gz ./
+COPY ./spec/resources/references.json.gz ./
 RUN ./target/release/preprocessor references.json.gz index.bin
 
 # ── Stage 2: minimal runtime image ───────────────────────────────────────────
