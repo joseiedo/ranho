@@ -317,26 +317,18 @@ impl SearchIndex {
                     metrics.pruned_clusters += 1;
                     continue;
                 }
-
-                metrics.scanned_clusters += 1;
-                let start_idx = self.offsets[visit.ci] as usize;
-                let end_idx = self.offsets[visit.ci + 1] as usize;
-
-                for j in start_idx..end_idx {
-                    let dist = dist_fn(query, vectors, j);
-                    metrics.scanned_vectors += 1;
-
-                    if top_len < K {
-                        top[top_len] = (dist, labels[j]);
-                        top_len += 1;
-                        if top_len == K {
-                            recompute_worst(&top, &mut worst_dist, &mut worst_pos);
-                        }
-                    } else if dist < worst_dist {
-                        top[worst_pos] = (dist, labels[j]);
-                        recompute_worst(&top, &mut worst_dist, &mut worst_pos);
-                    }
-                }
+                self.scan_exact_cluster(
+                    query,
+                    vectors,
+                    labels,
+                    *visit,
+                    &dist_fn,
+                    &mut top,
+                    &mut top_len,
+                    &mut worst_dist,
+                    &mut worst_pos,
+                    &mut metrics,
+                );
             }
             metrics.scan_time_ns = start.elapsed().as_nanos();
 
@@ -438,6 +430,42 @@ impl SearchIndex {
                     top[*worst_pos] = (dist, labels[j]);
                     recompute_worst(top, worst_dist, worst_pos);
                 }
+            }
+        }
+    }
+
+    fn scan_exact_cluster<DistFn>(
+        &self,
+        query: &[i16; DIMS],
+        vectors: &[u8],
+        labels: &[u8],
+        visit: ClusterVisit,
+        dist_fn: &DistFn,
+        top: &mut [(i64, u8); K],
+        top_len: &mut usize,
+        worst_dist: &mut i64,
+        worst_pos: &mut usize,
+        metrics: &mut SearchMetrics,
+    ) where
+        DistFn: Fn(&[i16; DIMS], &[u8], usize) -> i64,
+    {
+        metrics.scanned_clusters += 1;
+        let start_idx = self.offsets[visit.ci] as usize;
+        let end_idx = self.offsets[visit.ci + 1] as usize;
+
+        for j in start_idx..end_idx {
+            let dist = dist_fn(query, vectors, j);
+            metrics.scanned_vectors += 1;
+
+            if *top_len < K {
+                top[*top_len] = (dist, labels[j]);
+                *top_len += 1;
+                if *top_len == K {
+                    recompute_worst(top, worst_dist, worst_pos);
+                }
+            } else if dist < *worst_dist {
+                top[*worst_pos] = (dist, labels[j]);
+                recompute_worst(top, worst_dist, worst_pos);
             }
         }
     }
