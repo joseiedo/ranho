@@ -1,24 +1,50 @@
-// This processor uses the references.json.gz file as a source.
-// - Uses k-means++ to find centroids
-// -
-
 use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
+pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF4";
+const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
-const NLIST: usize = 4096;
+const PADDED_DIMS: usize = 16;
+const STRIDE: usize = PADDED_DIMS * 2;
+const DEFAULT_NLIST: usize = 4096;
 const KMEANS_ITERS: usize = 25;
-const SAMPLE_SIZE: usize = 60_000;
+const DEFAULT_SAMPLE_SIZE: usize = 60_000;
 const QUANT_SCALE: f32 = 10_000.0;
+const SAMPLE_SEED: u64 = 0x4d595df4d0f33173;
 
 #[derive(Deserialize)]
 struct Reference {
     vector: [f32; 14],
     label: String,
+}
+
+#[derive(Clone)]
+struct Lcg64 {
+    state: u64,
+}
+
+impl Lcg64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.state
+    }
+
+    fn gen_range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        (self.next_u64() % upper as u64) as usize
+    }
 }
 
 #[inline]
@@ -53,10 +79,47 @@ fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
     best
 }
 
-// k-means++ initialization: https://en.wikipedia.org/wiki/K-means%2B%2B
+fn make_sample_indices(n: usize, sample_size: usize, seed: u64) -> Vec<usize> {
+    let sample_size = sample_size.min(n);
+    let mut sample: Vec<usize> = (0..sample_size).collect();
+    let mut rng = Lcg64::new(seed);
+
+    for i in sample_size..n {
+        let slot = rng.gen_range(i + 1);
+        if slot < sample_size {
+            sample[slot] = i;
+        }
+    }
+
+    sample.sort_unstable();
+    sample
+}
+
+fn percentile(sorted: &[u32], numerator: usize, denominator: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) * numerator) / denominator;
+    sorted[idx]
+}
+
+fn report_cluster_balance(counts: &[u32]) {
+    let mut sorted = counts.to_vec();
+    sorted.sort_unstable();
+    let min = *sorted.first().unwrap_or(&0);
+    let median = percentile(&sorted, 1, 2);
+    let p95 = percentile(&sorted, 95, 100);
+    let max = *sorted.last().unwrap_or(&0);
+
+    eprintln!(
+        "preprocessor: cluster sizes min={min} median={median} p95={p95} max={max}"
+    );
+}
+
 fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Vec<f32> {
     let mut flat = vec![0.0f32; nlist * DIMS];
     let mut dmin = vec![f32::MAX; sample.len()];
+    let mut rng = Lcg64::new(SAMPLE_SEED ^ sample.len() as u64 ^ nlist as u64);
 
     flat[..DIMS].copy_from_slice(&vectors[sample[0]]);
 
@@ -78,8 +141,7 @@ fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Ve
         let chosen = if total <= 0.0 {
             0
         } else {
-            let threshold =
-                total * ((c as u64).wrapping_mul(0x9e3779b97f4a7c15u64) as f64 / u64::MAX as f64);
+            let threshold = total * (rng.next_u64() as f64 / u64::MAX as f64);
             let mut acc = 0.0f64;
             let mut chosen = sample.len() - 1;
             for (i, &d) in dmin.iter().enumerate() {
@@ -108,6 +170,14 @@ fn main() {
     let output_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "./resources/index.bin".to_string());
+    let nlist = std::env::var("NLIST")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_NLIST);
+    let sample_cap = std::env::var("SAMPLE_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SAMPLE_SIZE);
 
     eprintln!("preprocessor: reading {input_path}");
     let file = File::open(&input_path).expect("failed to open input");
@@ -125,12 +195,11 @@ fn main() {
         .collect();
     drop(refs);
 
-    let nlist_actual = NLIST.min(n);
-
-    let sample_size = SAMPLE_SIZE.min(n);
-    let sample: Vec<usize> = (0..sample_size).map(|i| i * (n / sample_size)).collect();
+    let nlist_actual = nlist.min(n.max(1));
+    let sample_size = sample_cap.min(n);
+    let sample = make_sample_indices(n, sample_size, SAMPLE_SEED);
     eprintln!(
-        "preprocessor: k-means on sample={sample_size} (NLIST={nlist_actual}, iters={KMEANS_ITERS})"
+        "preprocessor: k-means on sample={sample_size} (NLIST={nlist_actual}, iters={KMEANS_ITERS}, seed={SAMPLE_SEED:#x})"
     );
 
     eprintln!("preprocessor: kmeans++ init...");
@@ -139,23 +208,12 @@ fn main() {
     let mut sample_assignments = vec![0u32; sample_size];
     let nthreads = rayon::current_num_threads();
 
-    // Now we do the k-means iterations. Each iteration consists of two steps:
-    // 1. Assign each sample vector to the nearest centroid (parallelized).
-    // 2. Update each centroid to be the mean of its assigned vectors (parallelized with reduction).
-    // We track how many vectors changed their assignment, and stop early if it reaches zero.
-    // This is the lloyd's algorithm variant of k-means.
-    // https://en.wikipedia.org/wiki/K-means
-    // Run Lloyd's k-means refinement loop over the sampled vectors.
-    // Each iteration assigns vectors to the nearest centroid, then recomputes
-    // each centroid as the mean of its assigned vectors.
     for iter in 0..KMEANS_ITERS {
-        // Step 1: assign each sampled vector to its nearest centroid.
         let new_assignments: Vec<u32> = sample
             .par_iter()
             .map(|&si| nearest(&vectors[si], &centroids_flat, nlist_actual))
             .collect();
 
-        // Count assignment changes so we can stop early once the clustering converges.
         let changed = new_assignments
             .iter()
             .zip(sample_assignments.iter())
@@ -163,8 +221,7 @@ fn main() {
             .count();
         sample_assignments = new_assignments;
 
-        // Step 2a: accumulate per-centroid sums and counts in thread-local buffers.
-        let chunk = (sample_size + nthreads - 1) / nthreads;
+        let chunk = (sample_size + nthreads - 1) / nthreads.max(1);
         let thread_results: Vec<(Vec<f64>, Vec<u32>)> = (0..nthreads)
             .into_par_iter()
             .map(|tid| {
@@ -185,7 +242,6 @@ fn main() {
             })
             .collect();
 
-        // Step 2b: reduce the thread-local accumulators into global sums and counts.
         let mut global_sums = vec![0.0f64; nlist_actual * DIMS];
         let mut global_counts = vec![0u32; nlist_actual];
         for (sums, counts) in &thread_results {
@@ -197,7 +253,6 @@ fn main() {
             }
         }
 
-        // Step 2c: divide sums by counts to update each centroid to its mean.
         for ci in 0..nlist_actual {
             if global_counts[ci] > 0 {
                 let inv = 1.0 / global_counts[ci] as f64;
@@ -209,10 +264,11 @@ fn main() {
         }
 
         eprintln!(
-            "  iter {}/{KMEANS_ITERS}: {changed} reassignments",
-            iter + 1
+            "  iter {}/{}: {} reassignments",
+            iter + 1,
+            KMEANS_ITERS,
+            changed
         );
-        // No assignment changes means the sampled clustering has converged.
         if changed == 0 {
             break;
         }
@@ -224,12 +280,13 @@ fn main() {
         .map(|v| nearest(v, &centroids_flat, nlist_actual))
         .collect();
 
-    eprintln!("preprocessor: sorting vectors by cluster...");
     let mut counts = vec![0u32; nlist_actual];
     for &c in &assignments {
         counts[c as usize] += 1;
     }
+    report_cluster_balance(&counts);
 
+    eprintln!("preprocessor: sorting vectors by cluster...");
     let mut cluster_starts = vec![0u32; nlist_actual + 1];
     let mut running: u32 = 0;
     for ci in 0..nlist_actual {
@@ -240,6 +297,25 @@ fn main() {
 
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| assignments[i]);
+
+    let mut radii = vec![0.0f32; nlist_actual];
+    for ci in 0..nlist_actual {
+        let base = ci * DIMS;
+        let centroid = &centroids_flat[base..base + DIMS];
+        let centroid_q: [f32; DIMS] =
+            std::array::from_fn(|d| centroid[d] * QUANT_SCALE);
+        let start = cluster_starts[ci] as usize;
+        let end = cluster_starts[ci + 1] as usize;
+
+        for &idx in &order[start..end] {
+            let mut dist = 0.0f32;
+            for d in 0..DIMS {
+                let diff = quantize(vectors[idx][d]) as f32 - centroid_q[d];
+                dist += diff * diff;
+            }
+            radii[ci] = radii[ci].max(dist.sqrt());
+        }
+    }
 
     eprintln!("preprocessor: writing IVF index...");
     let out = File::create(&output_path).expect("failed to create output");
@@ -256,15 +332,19 @@ fn main() {
         writer.write_all(&v.to_le_bytes()).unwrap();
     }
 
-    for &o in &cluster_starts {
-        writer.write_all(&o.to_le_bytes()).unwrap();
+    for &offset in &cluster_starts {
+        writer.write_all(&offset.to_le_bytes()).unwrap();
+    }
+
+    for &radius in &radii {
+        writer.write_all(&radius.to_le_bytes()).unwrap();
     }
 
     for &idx in &order {
         for &v in &vectors[idx] {
             writer.write_all(&quantize(v).to_le_bytes()).unwrap();
         }
-        writer.write_all(&[0u8; 4]).unwrap();
+        writer.write_all(&[0u8; STRIDE - DIMS * 2]).unwrap();
     }
 
     for &idx in &order {
@@ -273,6 +353,7 @@ fn main() {
 
     writer.flush().unwrap();
 
-    let file_size = 20 + nlist_actual * DIMS * 4 + (nlist_actual + 1) * 4 + n * 32 + n;
+    let file_size =
+        HEADER_SIZE + nlist_actual * DIMS * 4 + (nlist_actual + 1) * 4 + nlist_actual * 4 + n * STRIDE + n;
     eprintln!("preprocessor: wrote {output_path} ({file_size} bytes, IVF NLIST={nlist_actual})");
 }
