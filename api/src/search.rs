@@ -275,7 +275,10 @@ impl SearchIndex {
         query_f32: &[f32; DIMS],
         query: &[i16; DIMS],
     ) -> ([Label; K], SearchMetrics) {
+        use std::arch::x86_64::*;
+
         let padded_query = pad_query(query);
+        let query_reg = _mm256_loadu_si256(padded_query.as_ptr() as *const __m256i);
         self.search_impl_inner(
             query_f32,
             query,
@@ -283,7 +286,7 @@ impl SearchIndex {
                 centroid_distances_top_avx2(centroids, query_f32, nprobe_slow)
             },
             |centroids, radii, _query| centroid_visits_all_avx2(centroids, radii, &padded_query),
-            |_query, records, idx| dist_avx2_record(&padded_query, records, idx),
+            |_query, records, idx| dist_avx2_record_with_query_reg(query_reg, records, idx),
         )
     }
 
@@ -662,10 +665,14 @@ unsafe fn centroid_visits_all_avx2(
     radii: &[f32],
     query: &[i16; PADDED_DIMS],
 ) -> Vec<ClusterVisit> {
+    use std::arch::x86_64::*;
+
     let mut ordered = Vec::with_capacity(centroids.len());
+    let query_reg = _mm256_loadu_si256(query.as_ptr() as *const __m256i);
 
     for (ci, centroid) in centroids.iter().enumerate() {
-        let exact_sq = sq_dist_i16x16_avx2(query, centroid);
+        let centroid_reg = _mm256_loadu_si256(centroid.as_ptr() as *const __m256i);
+        let exact_sq = sq_dist_i16x16_regs_avx2(query_reg, centroid_reg);
         let lower_bound = ((exact_sq as f32).sqrt() - radii[ci]).max(0.0);
         ordered.push(ClusterVisit {
             ci,
@@ -681,8 +688,10 @@ unsafe fn centroid_visits_all_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dist_avx2_record(query: &[i16; PADDED_DIMS], records: &[u8], idx: usize) -> i64 {
-    let record = load_record(records, idx);
-    sq_dist_i16x16_avx2(query, &record)
+    use std::arch::x86_64::*;
+
+    let query_reg = _mm256_loadu_si256(query.as_ptr() as *const __m256i);
+    dist_avx2_record_with_query_reg(query_reg, records, idx)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -692,25 +701,35 @@ unsafe fn sq_dist_i16x16_avx2(lhs: &[i16; PADDED_DIMS], rhs: &[i16; PADDED_DIMS]
 
     let q = _mm256_loadu_si256(lhs.as_ptr() as *const __m256i);
     let r = _mm256_loadu_si256(rhs.as_ptr() as *const __m256i);
-    let q_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(q));
-    let q_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(q, 1));
-    let r_lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(r));
-    let r_hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(r, 1));
-
-    let d_lo = _mm256_sub_epi32(q_lo, r_lo);
-    let d_hi = _mm256_sub_epi32(q_hi, r_hi);
-    sum_sq_i32x8_avx2(d_lo) + sum_sq_i32x8_avx2(d_hi)
+    sq_dist_i16x16_regs_avx2(q, r)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sum_sq_i32x8_avx2(v: std::arch::x86_64::__m256i) -> i64 {
+unsafe fn dist_avx2_record_with_query_reg(
+    query_reg: std::arch::x86_64::__m256i,
+    records: &[u8],
+    idx: usize,
+) -> i64 {
     use std::arch::x86_64::*;
 
-    let even = _mm256_mul_epi32(v, v);
-    let odd_input = _mm256_srli_si256(v, 4);
-    let odd = _mm256_mul_epi32(odd_input, odd_input);
-    hsum_epi64x4(_mm256_add_epi64(even, odd))
+    let base = idx * STRIDE;
+    let record_ptr = records.as_ptr().add(base) as *const __m256i;
+    let record_reg = _mm256_loadu_si256(record_ptr);
+    sq_dist_i16x16_regs_avx2(query_reg, record_reg)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq_dist_i16x16_regs_avx2(
+    lhs: std::arch::x86_64::__m256i,
+    rhs: std::arch::x86_64::__m256i,
+) -> i64 {
+    use std::arch::x86_64::*;
+
+    let diff = _mm256_sub_epi16(lhs, rhs);
+    let pair_sums = _mm256_madd_epi16(diff, diff);
+    hsum_epi32x8(pair_sums) as i64
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -743,6 +762,19 @@ unsafe fn hsum_epi64x4(v: std::arch::x86_64::__m256i) -> i64 {
     let sum128 = _mm_add_epi64(lo, hi);
     let swapped = _mm_unpackhi_epi64(sum128, sum128);
     _mm_cvtsi128_si64(_mm_add_epi64(sum128, swapped))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_epi32x8(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+
+    let hi = _mm256_extracti128_si256(v, 1);
+    let lo = _mm256_castsi256_si128(v);
+    let sum128 = _mm_add_epi32(lo, hi);
+    let sum128 = _mm_hadd_epi32(sum128, sum128);
+    let sum128 = _mm_hadd_epi32(sum128, sum128);
+    _mm_cvtsi128_si32(sum128)
 }
 
 #[cfg(test)]
