@@ -2,6 +2,9 @@ use crate::types::Label;
 use memmap2::Mmap;
 use std::fs::File;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
 const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
@@ -9,6 +12,7 @@ const STRIDE: usize = 32;
 const K: usize = 5;
 const NPROBE_FAST: usize = 8;
 const NPROBE_SLOW: usize = 64;
+const PADDED_DIMS: usize = 16;
 
 pub struct SearchIndex {
     mmap: Mmap,
@@ -118,27 +122,8 @@ impl SearchIndex {
         self.search_impl(query_f32, query)
     }
 
-    // On x86_64 and aarch64, this will dispatch to an SIMD-optimized implementation.
-    // On other platforms, it will use the scalar implementation.
     fn search_impl(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        #[cfg(target_arch = "x86_64")]
-        return unsafe { self.search_avx2(query_f32, query) };
-        #[cfg(target_arch = "aarch64")]
-        return unsafe { self.search_neon(query_f32, query) };
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         return self.search_impl_inner(query_f32, query);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn search_avx2(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl_inner(query_f32, query)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
-    unsafe fn search_neon(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl_inner(query_f32, query)
     }
 
     // The strategy here is:
@@ -186,8 +171,11 @@ impl SearchIndex {
         let mut worst_dist = i64::MAX;
         let mut worst_pos = 0usize;
 
+        let query_simd = pad_query_i16(query);
+
         self.scan_clusters(
             query,
+            &query_simd,
             vectors,
             labels,
             &probed[..nprobe_fast],
@@ -199,12 +187,13 @@ impl SearchIndex {
 
         let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
 
-        if top_len >= K && (fraud_count == 0 || fraud_count == 1 || fraud_count == 5) {
+        if top_len >= K && (fraud_count == 0 || fraud_count == 5) {
             return labels_to_result(&top);
         }
 
         self.scan_clusters(
             query,
+            &query_simd,
             vectors,
             labels,
             &probed[nprobe_fast..nprobe_slow],
@@ -220,6 +209,71 @@ impl SearchIndex {
     fn scan_clusters(
         &self,
         query: &[i16; DIMS],
+        _query_simd: &[i16; PADDED_DIMS],
+        vectors: &[u8],
+        labels: &[u8],
+        clusters: &[usize],
+        top: &mut [(i64, u8); K],
+        top_len: &mut usize,
+        worst_dist: &mut i64,
+        worst_pos: &mut usize,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                self.scan_clusters_avx2(
+                    _query_simd,
+                    vectors,
+                    labels,
+                    clusters,
+                    top,
+                    top_len,
+                    worst_dist,
+                    worst_pos,
+                );
+            }
+            return;
+        }
+
+        for &ci in clusters {
+            let start = self.offsets[ci] as usize;
+            let end = self.offsets[ci + 1] as usize;
+
+            for j in start..end {
+                let base = j * STRIDE;
+                let dist = dist_scalar(query, &vectors[base..base + STRIDE]);
+
+                if *top_len < K {
+                    top[*top_len] = (dist, labels[j]);
+                    *top_len += 1;
+                    if *top_len == K {
+                        *worst_pos = 0;
+                        for i in 1..K {
+                            if top[i].0 > top[*worst_pos].0 {
+                                *worst_pos = i;
+                            }
+                        }
+                        *worst_dist = top[*worst_pos].0;
+                    }
+                } else if dist < *worst_dist {
+                    top[*worst_pos] = (dist, labels[j]);
+                    *worst_pos = 0;
+                    for i in 1..K {
+                        if top[i].0 > top[*worst_pos].0 {
+                            *worst_pos = i;
+                        }
+                    }
+                    *worst_dist = top[*worst_pos].0;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn scan_clusters_avx2(
+        &self,
+        query: &[i16; PADDED_DIMS],
         vectors: &[u8],
         labels: &[u8],
         clusters: &[usize],
@@ -234,7 +288,7 @@ impl SearchIndex {
 
             for j in start..end {
                 let base = j * STRIDE;
-                let dist = dist_scalar(query, &vectors[base..base + STRIDE]);
+                let dist = dist_avx2(query, &vectors[base..base + STRIDE]);
 
                 if *top_len < K {
                     top[*top_len] = (dist, labels[j]);
@@ -284,6 +338,30 @@ fn dist_scalar(query: &[i16; DIMS], record: &[u8]) -> i64 {
         dist += diff * diff;
     }
     dist
+}
+
+#[inline(always)]
+fn pad_query_i16(query: &[i16; DIMS]) -> [i16; PADDED_DIMS] {
+    let mut padded = [0i16; PADDED_DIMS];
+    padded[..DIMS].copy_from_slice(query);
+    padded
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dist_avx2(query: &[i16; PADDED_DIMS], record: &[u8]) -> i64 {
+    let q = unsafe { _mm256_loadu_si256(query.as_ptr().cast::<__m256i>()) };
+    let r = unsafe { _mm256_loadu_si256(record.as_ptr().cast::<__m256i>()) };
+    let diff = _mm256_sub_epi16(q, r);
+    let squares = _mm256_madd_epi16(diff, diff);
+
+    let lo = _mm256_castsi256_si128(squares);
+    let hi = _mm256_extracti128_si256(squares, 1);
+    let sum128 = _mm_add_epi32(lo, hi);
+    let sum64 = _mm_hadd_epi32(sum128, sum128);
+    let sum32 = _mm_hadd_epi32(sum64, sum64);
+
+    _mm_cvtsi128_si32(sum32) as i64
 }
 
 #[cfg(test)]
