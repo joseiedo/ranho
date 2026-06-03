@@ -10,8 +10,9 @@ const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
-const NPROBE_FAST: usize = 8;
-const NPROBE_SLOW: usize = 152;
+const NPROBE_FAST: usize = 64;
+const NPROBE_RETRY: usize = 88;
+const NPROBE_SLOW: usize = NPROBE_FAST + NPROBE_RETRY;
 const PADDED_DIMS: usize = 16;
 
 pub struct SearchIndex {
@@ -172,19 +173,26 @@ impl SearchIndex {
             &mut worst_pos,
         );
 
-        self.scan_clusters(
-            query,
-            &query_simd,
-            vectors,
-            labels,
-            &probed[nprobe_fast..nprobe_slow],
-            &mut top,
-            &mut top_len,
-            &mut worst_dist,
-            &mut worst_pos,
-        );
+        let result = labels_to_result(&top);
+        let fraud_count = result.iter().filter(|&&l| l == Label::Fraud).count();
 
-        labels_to_result(&top)
+        if fraud_count == 2 || fraud_count == 3 {
+            let retry_end = nprobe_slow.min(nprobe_fast + NPROBE_RETRY);
+            self.scan_clusters(
+                query,
+                &query_simd,
+                vectors,
+                labels,
+                &probed[nprobe_fast..retry_end],
+                &mut top,
+                &mut top_len,
+                &mut worst_dist,
+                &mut worst_pos,
+            );
+            labels_to_result(&top)
+        } else {
+            result
+        }
     }
 
     fn scan_clusters(
