@@ -11,7 +11,7 @@ const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
 const NPROBE_FAST: usize = 8;
-const NPROBE_SLOW: usize = 64;
+const NPROBE_SLOW: usize = 152;
 const PADDED_DIMS: usize = 16;
 
 pub struct SearchIndex {
@@ -83,6 +83,59 @@ impl SearchIndex {
             data_byte,
             labels_byte,
         })
+    }
+
+    pub fn search_brute_force(&self, query: &[i16; DIMS]) -> [Label; K] {
+        let vectors = &self.mmap[self.data_byte..self.labels_byte];
+        let labels = &self.mmap[self.labels_byte..];
+        let n = self.n;
+
+        let mut top = [(i64::MAX, 0u8); K];
+        let mut worst_dist = i64::MAX;
+        let mut worst_pos = 0usize;
+
+        for j in 0..n {
+            let base = j * STRIDE;
+            let dist = dist_scalar(query, &vectors[base..base + STRIDE]);
+
+            if dist < worst_dist || j < K {
+                if j < K {
+                    top[j] = (dist, labels[j]);
+                    if j + 1 == K {
+                        worst_pos = 0;
+                        for i in 1..K {
+                            if top[i].0 > top[worst_pos].0 {
+                                worst_pos = i;
+                            }
+                        }
+                        worst_dist = top[worst_pos].0;
+                    }
+                } else {
+                    top[worst_pos] = (dist, labels[j]);
+                    worst_pos = 0;
+                    for i in 1..K {
+                        if top[i].0 > top[worst_pos].0 {
+                            worst_pos = i;
+                        }
+                    }
+                    worst_dist = top[worst_pos].0;
+                }
+            }
+        }
+
+        labels_to_result(&top)
+    }
+
+    pub fn labels_byte(&self) -> usize {
+        self.labels_byte
+    }
+
+    pub fn data_byte(&self) -> usize {
+        self.data_byte
+    }
+
+    pub fn n(&self) -> usize {
+        self.n
     }
 
     pub fn count(&self) -> usize {
@@ -337,8 +390,8 @@ fn pad_query_i16(query: &[i16; DIMS]) -> [i16; PADDED_DIMS] {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dist_avx2(query: &[i16; PADDED_DIMS], record: &[u8]) -> i64 {
-    let q = unsafe { _mm256_loadu_si256(query.as_ptr().cast::<__m256i>()) };
-    let r = unsafe { _mm256_loadu_si256(record.as_ptr().cast::<__m256i>()) };
+    let q = _mm256_loadu_si256(query.as_ptr().cast::<__m256i>());
+    let r = _mm256_loadu_si256(record.as_ptr().cast::<__m256i>());
     let diff = _mm256_sub_epi16(q, r);
     let squares = _mm256_madd_epi16(diff, diff);
 
