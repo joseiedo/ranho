@@ -9,8 +9,8 @@ Detecção de fraude via KNN nos 3 milhões de vetores de referência.
 **Índice:** IVF (Inverted File Index) pré-construído pelo `preprocessor` com K-means++. Vetores armazenados em arquivo binário mapeado em memória (`mmap`).
 
 **Busca em duas fases:**
-- Fase 1 — proba 8 clusters mais próximos. Se o resultado for inequívoco (0, 1 ou 5 vizinhos fraud com K=5 completos), retorna imediatamente.
-- Fase 2 — proba até 64 clusters para casos ambíguos (2, 3 ou 4 fraud).
+- Fase 1 — proba 8 clusters mais próximos.
+- Fase 2 — expande para até 64 clusters para refinar o resultado.
 
 **Scoring:** `fraud_score = fraud_count / 5`. Aprovado se `< 0.6`.
 

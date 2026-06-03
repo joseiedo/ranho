@@ -126,13 +126,6 @@ impl SearchIndex {
         return self.search_impl_inner(query_f32, query);
     }
 
-    // The strategy here is:
-    // 1. Compute distances to all centroids and keep the closest NPROBE_SLOW clusters.
-    // 2. Scan the closest NPROBE_FAST clusters and keep the closest K neighbors
-    // 3. If the closest K neighbors contain 0, 1, or 5 frauds, return that result immediately.
-    // 4. If not, scan the remaining NPROBE_SLOW - NPROBE_FAST clusters and return the final result.
-    // This is a trick to optmize for the common cases and handle the edge cases. I hope this don't
-    // break in the final evaluation, but it was fun to implement and experiment with.
     fn search_impl_inner(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
         let labels = &self.mmap[self.labels_byte..];
@@ -184,12 +177,6 @@ impl SearchIndex {
             &mut worst_dist,
             &mut worst_pos,
         );
-
-        let fraud_count = top[..top_len].iter().filter(|&&(_, l)| l == 1).count();
-
-        if top_len >= K && (fraud_count == 0 || fraud_count == 5) {
-            return labels_to_result(&top);
-        }
 
         self.scan_clusters(
             query,
