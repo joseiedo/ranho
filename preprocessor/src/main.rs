@@ -4,11 +4,11 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF4";
+pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF5";
 const DIMS: usize = 14;
-const NLIST: usize = 4096;
-const KMEANS_ITERS: usize = 25;
-const SAMPLE_SIZE: usize = 60_000;
+const NLIST: usize = 2048;
+const KMEANS_ITERS: usize = 10;
+const SAMPLE_SIZE: usize = 131_072;
 const QUANT_SCALE: f32 = 10_000.0;
 
 #[derive(Deserialize)]
@@ -57,53 +57,11 @@ fn nearest_i16(v: &[i16; DIMS], centroids: &[i16], nlist: usize) -> u32 {
     best
 }
 
-fn kmeans_pp_init_i16(
-    vectors: &[[i16; DIMS]],
-    sample: &[usize],
-    nlist: usize,
-) -> Vec<i16> {
+fn deterministic_init(vectors: &[[i16; DIMS]], sample: &[usize], nlist: usize) -> Vec<i16> {
     let mut flat = vec![0i16; nlist * DIMS];
-    let mut dmin = vec![i64::MAX; sample.len()];
-
-    flat[..DIMS].copy_from_slice(&vectors[sample[0]]);
-
-    for c in 1..nlist {
-        let prev_base = (c - 1) * DIMS;
-        for (i, &si) in sample.iter().enumerate() {
-            let v = &vectors[si];
-            let mut d: i64 = 0;
-            for k in 0..DIMS {
-                let diff = v[k] as i64 - flat[prev_base + k] as i64;
-                d += diff * diff;
-            }
-            if d < dmin[i] {
-                dmin[i] = d;
-            }
-        }
-
-        let total: f64 = dmin.iter().map(|&x| x as f64).sum();
-        let chosen = if total <= 0.0 {
-            0
-        } else {
-            let threshold =
-                total * ((c as u64).wrapping_mul(0x9e3779b97f4a7c15u64) as f64 / u64::MAX as f64);
-            let mut acc = 0.0f64;
-            let mut chosen = sample.len() - 1;
-            for (i, &d) in dmin.iter().enumerate() {
-                acc += d as f64;
-                if acc >= threshold {
-                    chosen = i;
-                    break;
-                }
-            }
-            chosen
-        };
-
-        flat[c * DIMS..(c + 1) * DIMS].copy_from_slice(&vectors[sample[chosen]]);
-
-        if c % 512 == 0 {
-            eprintln!("  kmeans++ init: {c}/{nlist}");
-        }
+    for c in 0..nlist {
+        let si = (c as u64 * sample.len() as u64 / nlist as u64) as usize;
+        flat[c * DIMS..(c + 1) * DIMS].copy_from_slice(&vectors[sample[si]]);
     }
     flat
 }
@@ -136,15 +94,14 @@ fn main() {
     drop(vectors_f32);
 
     let nlist_actual = NLIST.min(n);
-
     let sample_size = SAMPLE_SIZE.min(n);
     let sample: Vec<usize> = (0..sample_size).map(|i| i * (n / sample_size)).collect();
     eprintln!(
         "preprocessor: k-means on sample={sample_size} (NLIST={nlist_actual}, iters={KMEANS_ITERS})"
     );
 
-    eprintln!("preprocessor: kmeans++ init...");
-    let mut centroids_i16 = kmeans_pp_init_i16(&vectors, &sample, nlist_actual);
+    eprintln!("preprocessor: deterministic init...");
+    let mut centroids_i16 = deterministic_init(&vectors, &sample, nlist_actual);
 
     let mut sample_assignments = vec![0u32; sample_size];
     let nthreads = rayon::current_num_threads();
@@ -236,6 +193,39 @@ fn main() {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| assignments[i]);
 
+    eprintln!("preprocessor: computing bounding boxes...");
+    let mut sorted = vec![0usize; n];
+    for (i, &idx) in order.iter().enumerate() {
+        sorted[idx] = i;
+    }
+
+    let mut bbox_min = vec![i16::MAX; nlist_actual * DIMS];
+    let mut bbox_max = vec![i16::MIN; nlist_actual * DIMS];
+    for ci in 0..nlist_actual {
+        let base = ci * DIMS;
+        let start = cluster_starts[ci] as usize;
+        let end = cluster_starts[ci + 1] as usize;
+        for j in start..end {
+            let v = &vectors[order[j]];
+            for d in 0..DIMS {
+                let vd = v[d];
+                let idx = base + d;
+                if vd < bbox_min[idx] {
+                    bbox_min[idx] = vd;
+                }
+                if vd > bbox_max[idx] {
+                    bbox_max[idx] = vd;
+                }
+            }
+        }
+        if start == end {
+            for d in 0..DIMS {
+                bbox_min[base + d] = 0;
+                bbox_max[base + d] = 0;
+            }
+        }
+    }
+
     eprintln!("preprocessor: writing IVF index...");
     let out = File::create(&output_path).expect("failed to create output");
     let mut writer = BufWriter::new(out);
@@ -248,6 +238,14 @@ fn main() {
     writer.write_all(&(DIMS as u32).to_le_bytes()).unwrap();
 
     for &v in &centroids_i16 {
+        writer.write_all(&v.to_le_bytes()).unwrap();
+    }
+
+    for &v in &bbox_min {
+        writer.write_all(&v.to_le_bytes()).unwrap();
+    }
+
+    for &v in &bbox_max {
         writer.write_all(&v.to_le_bytes()).unwrap();
     }
 
@@ -268,6 +266,14 @@ fn main() {
 
     writer.flush().unwrap();
 
-    let file_size = 20 + nlist_actual * DIMS * 2 + (nlist_actual + 1) * 4 + n * 32 + n;
-    eprintln!("preprocessor: wrote {output_path} ({file_size} bytes, IVF NLIST={nlist_actual})");
+    let file_size = 20
+        + nlist_actual * DIMS * 2
+        + nlist_actual * DIMS * 2
+        + nlist_actual * DIMS * 2
+        + (nlist_actual + 1) * 4
+        + n * 32
+        + n;
+    eprintln!(
+        "preprocessor: wrote {output_path} ({file_size} bytes, IVF NLIST={nlist_actual})"
+    );
 }

@@ -5,13 +5,13 @@ use std::fs::File;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-const IVF_MAGIC: &[u8; 8] = b"RINHIVF4";
+const IVF_MAGIC: &[u8; 8] = b"RINHIVF5";
 const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
-const NPROBE_FAST: usize = 64;
-const NPROBE_RETRY: usize = 88;
+const NPROBE_FAST: usize = 10;
+const NPROBE_RETRY: usize = 142;
 const NPROBE_SLOW: usize = NPROBE_FAST + NPROBE_RETRY;
 const PADDED_DIMS: usize = 16;
 
@@ -20,6 +20,8 @@ pub struct SearchIndex {
     k_clusters: usize,
     n: usize,
     centroids_i16: Vec<i16>,
+    bbox_min: Vec<i16>,
+    bbox_max: Vec<i16>,
     offsets: Vec<u32>,
     data_byte: usize,
     labels_byte: usize,
@@ -55,7 +57,8 @@ impl SearchIndex {
 
         let centroids_byte = HEADER_SIZE;
         let centroids_len = k_clusters * DIMS;
-        let offsets_byte = centroids_byte + centroids_len * 2;
+        let bbox_byte = centroids_byte + centroids_len * 2;
+        let offsets_byte = bbox_byte + centroids_len * 2 * 2;
         let data_byte = offsets_byte + (k_clusters + 1) * 4;
         let labels_byte = data_byte + n * STRIDE;
 
@@ -65,6 +68,15 @@ impl SearchIndex {
             centroids_i16.push(i16::from_le_bytes(
                 mmap[off..off + 2].try_into().unwrap(),
             ));
+        }
+
+        let mut bbox_min = Vec::with_capacity(centroids_len);
+        let mut bbox_max = Vec::with_capacity(centroids_len);
+        for i in 0..centroids_len {
+            let off_min = bbox_byte + i * 2;
+            let off_max = bbox_byte + centroids_len * 2 + i * 2;
+            bbox_min.push(i16::from_le_bytes(mmap[off_min..off_min + 2].try_into().unwrap()));
+            bbox_max.push(i16::from_le_bytes(mmap[off_max..off_max + 2].try_into().unwrap()));
         }
 
         let mut offsets = Vec::with_capacity(k_clusters + 1);
@@ -78,6 +90,8 @@ impl SearchIndex {
             k_clusters,
             n,
             centroids_i16,
+            bbox_min,
+            bbox_max,
             offsets,
             data_byte,
             labels_byte,
@@ -178,17 +192,25 @@ impl SearchIndex {
 
         if fraud_count == 2 || fraud_count == 3 {
             let retry_end = nprobe_slow.min(nprobe_fast + NPROBE_RETRY);
-            self.scan_clusters(
-                query,
-                &query_simd,
-                vectors,
-                labels,
-                &probed[nprobe_fast..retry_end],
-                &mut top,
-                &mut top_len,
-                &mut worst_dist,
-                &mut worst_pos,
-            );
+            for &ci in &probed[nprobe_fast..retry_end] {
+                if top_len == K {
+                    let lb = bbox_lower_bound(query, &self.bbox_min, &self.bbox_max, ci);
+                    if lb >= worst_dist {
+                        continue;
+                    }
+                }
+                self.scan_clusters(
+                    query,
+                    &query_simd,
+                    vectors,
+                    labels,
+                    &[ci],
+                    &mut top,
+                    &mut top_len,
+                    &mut worst_dist,
+                    &mut worst_pos,
+                );
+            }
             labels_to_result(&top)
         } else {
             result
@@ -318,6 +340,26 @@ fn labels_to_result(top: &[(i64, u8); K]) -> [Label; K] {
 }
 
 #[inline(always)]
+fn bbox_lower_bound(query: &[i16; DIMS], bbox_min: &[i16], bbox_max: &[i16], ci: usize) -> i64 {
+    let base = ci * DIMS;
+    let mut lb: i64 = 0;
+    for d in 0..DIMS {
+        let q = query[d] as i32;
+        let lo = bbox_min[base + d] as i32;
+        let hi = bbox_max[base + d] as i32;
+        let diff = if q < lo {
+            lo - q
+        } else if q > hi {
+            q - hi
+        } else {
+            0
+        };
+        lb += (diff as i64) * (diff as i64);
+    }
+    lb
+}
+
+#[inline(always)]
 fn dist_scalar(query: &[i16; DIMS], record: &[u8]) -> i64 {
     let mut dist: i64 = 0;
     for d in 0..DIMS {
@@ -378,6 +420,13 @@ mod tests {
         let centroid_f32 = [0.0f32; DIMS];
         for &v in &centroid_f32 {
             f.write_all(&quantize(v).to_le_bytes()).unwrap();
+        }
+
+        for _ in 0..DIMS {
+            f.write_all(&0i16.to_le_bytes()).unwrap();
+        }
+        for _ in 0..DIMS {
+            f.write_all(&0i16.to_le_bytes()).unwrap();
         }
 
         f.write_all(&0u32.to_le_bytes()).unwrap();
