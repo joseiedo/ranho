@@ -7,7 +7,7 @@ use std::io::{BufWriter, Write};
 pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF5";
 const DIMS: usize = 14;
 const NLIST: usize = 2048;
-const KMEANS_ITERS: usize = 10;
+const KMEANS_ITERS: usize = 25;
 const SAMPLE_SIZE: usize = 131_072;
 const QUANT_SCALE: f32 = 10_000.0;
 
@@ -55,6 +55,53 @@ fn nearest_i16(v: &[i16; DIMS], centroids: &[i16], nlist: usize) -> u32 {
         }
     }
     best
+}
+
+fn kmeans_pp_init_i16(vectors: &[[i16; DIMS]], sample: &[usize], nlist: usize) -> Vec<i16> {
+    let mut flat = vec![0i16; nlist * DIMS];
+    let mut dmin = vec![i64::MAX; sample.len()];
+
+    flat[..DIMS].copy_from_slice(&vectors[sample[0]]);
+
+    for c in 1..nlist {
+        let prev_base = (c - 1) * DIMS;
+        for (i, &si) in sample.iter().enumerate() {
+            let v = &vectors[si];
+            let mut d: i64 = 0;
+            for k in 0..DIMS {
+                let diff = v[k] as i64 - flat[prev_base + k] as i64;
+                d += diff * diff;
+            }
+            if d < dmin[i] {
+                dmin[i] = d;
+            }
+        }
+
+        let total: f64 = dmin.iter().map(|&x| x as f64).sum();
+        let chosen = if total <= 0.0 {
+            0
+        } else {
+            let threshold =
+                total * ((c as u64).wrapping_mul(0x9e3779b97f4a7c15u64) as f64 / u64::MAX as f64);
+            let mut acc = 0.0f64;
+            let mut chosen = sample.len() - 1;
+            for (i, &d) in dmin.iter().enumerate() {
+                acc += d as f64;
+                if acc >= threshold {
+                    chosen = i;
+                    break;
+                }
+            }
+            chosen
+        };
+
+        flat[c * DIMS..(c + 1) * DIMS].copy_from_slice(&vectors[sample[chosen]]);
+
+        if c % 512 == 0 {
+            eprintln!("  kmeans++ init: {c}/{nlist}");
+        }
+    }
+    flat
 }
 
 fn deterministic_init(vectors: &[[i16; DIMS]], sample: &[usize], nlist: usize) -> Vec<i16> {
