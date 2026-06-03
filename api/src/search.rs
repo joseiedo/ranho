@@ -10,8 +10,8 @@ const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 const STRIDE: usize = 32;
 const K: usize = 5;
-const NPROBE_FAST: usize = 10;
-const NPROBE_RETRY: usize = 142;
+const NPROBE_FAST: usize = 8;
+const NPROBE_RETRY: usize = 144;
 const NPROBE_SLOW: usize = NPROBE_FAST + NPROBE_RETRY;
 const PADDED_DIMS: usize = 16;
 
