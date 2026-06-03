@@ -5,7 +5,7 @@ use std::fs::File;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
+const IVF_MAGIC: &[u8; 8] = b"RINHIVF4";
 const HEADER_SIZE: usize = 20;
 const DIMS: usize = 14;
 const STRIDE: usize = 32;
@@ -18,7 +18,7 @@ pub struct SearchIndex {
     mmap: Mmap,
     k_clusters: usize,
     n: usize,
-    centroids: Vec<[f32; DIMS]>,
+    centroids_i16: Vec<i16>,
     offsets: Vec<u32>,
     data_byte: usize,
     labels_byte: usize,
@@ -53,19 +53,17 @@ impl SearchIndex {
         }
 
         let centroids_byte = HEADER_SIZE;
-        let offsets_byte = centroids_byte + k_clusters * DIMS * 4;
+        let centroids_len = k_clusters * DIMS;
+        let offsets_byte = centroids_byte + centroids_len * 2;
         let data_byte = offsets_byte + (k_clusters + 1) * 4;
         let labels_byte = data_byte + n * STRIDE;
 
-        let mut centroids = Vec::with_capacity(k_clusters);
-        for ci in 0..k_clusters {
-            let base = centroids_byte + ci * DIMS * 4;
-            let mut c = [0.0f32; DIMS];
-            for d in 0..DIMS {
-                let off = base + d * 4;
-                c[d] = f32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
-            }
-            centroids.push(c);
+        let mut centroids_i16 = Vec::with_capacity(centroids_len);
+        for i in 0..centroids_len {
+            let off = centroids_byte + i * 2;
+            centroids_i16.push(i16::from_le_bytes(
+                mmap[off..off + 2].try_into().unwrap(),
+            ));
         }
 
         let mut offsets = Vec::with_capacity(k_clusters + 1);
@@ -78,64 +76,11 @@ impl SearchIndex {
             mmap,
             k_clusters,
             n,
-            centroids,
+            centroids_i16,
             offsets,
             data_byte,
             labels_byte,
         })
-    }
-
-    pub fn search_brute_force(&self, query: &[i16; DIMS]) -> [Label; K] {
-        let vectors = &self.mmap[self.data_byte..self.labels_byte];
-        let labels = &self.mmap[self.labels_byte..];
-        let n = self.n;
-
-        let mut top = [(i64::MAX, 0u8); K];
-        let mut worst_dist = i64::MAX;
-        let mut worst_pos = 0usize;
-
-        for j in 0..n {
-            let base = j * STRIDE;
-            let dist = dist_scalar(query, &vectors[base..base + STRIDE]);
-
-            if dist < worst_dist || j < K {
-                if j < K {
-                    top[j] = (dist, labels[j]);
-                    if j + 1 == K {
-                        worst_pos = 0;
-                        for i in 1..K {
-                            if top[i].0 > top[worst_pos].0 {
-                                worst_pos = i;
-                            }
-                        }
-                        worst_dist = top[worst_pos].0;
-                    }
-                } else {
-                    top[worst_pos] = (dist, labels[j]);
-                    worst_pos = 0;
-                    for i in 1..K {
-                        if top[i].0 > top[worst_pos].0 {
-                            worst_pos = i;
-                        }
-                    }
-                    worst_dist = top[worst_pos].0;
-                }
-            }
-        }
-
-        labels_to_result(&top)
-    }
-
-    pub fn labels_byte(&self) -> usize {
-        self.labels_byte
-    }
-
-    pub fn data_byte(&self) -> usize {
-        self.data_byte
-    }
-
-    pub fn n(&self) -> usize {
-        self.n
     }
 
     pub fn count(&self) -> usize {
@@ -164,38 +109,34 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query: &[i16; DIMS]) -> [Label; K] {
-        let mut query_f32 = [0.0f32; DIMS];
-        for d in 0..DIMS {
-            query_f32[d] = query[d] as f32 / 10_000.0;
-        }
-        self.search_impl(&query_f32, query)
+        self.search_impl(query)
     }
 
-    pub fn search_with_vector(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        self.search_impl(query_f32, query)
+    pub fn search_with_vector(&self, _query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+        self.search(query)
     }
 
-    fn search_impl(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
-        return self.search_impl_inner(query_f32, query);
-    }
-
-    fn search_impl_inner(&self, query_f32: &[f32; DIMS], query: &[i16; DIMS]) -> [Label; K] {
+    fn search_impl(&self, query: &[i16; DIMS]) -> [Label; K] {
         let vectors = &self.mmap[self.data_byte..self.labels_byte];
         let labels = &self.mmap[self.labels_byte..];
 
         let nprobe_slow = NPROBE_SLOW.min(self.k_clusters);
         let nprobe_fast = NPROBE_FAST.min(nprobe_slow);
-        let mut best = [(u32::MAX, 0usize); NPROBE_SLOW];
+        let mut best = [(u64::MAX, 0usize); NPROBE_SLOW];
 
-        for (ci, c) in self.centroids.iter().enumerate() {
-            let mut d = 0.0f32;
-            for i in 0..DIMS {
-                let diff = query_f32[i] - c[i];
-                d += diff * diff;
+        for ci in 0..self.k_clusters {
+            let base = ci * DIMS;
+            let mut dist: i64 = 0;
+            for d in 0..DIMS {
+                let diff = query[d] as i64 - self.centroids_i16[base + d] as i64;
+                dist += diff * diff;
             }
-            let db = d.to_bits();
-            if db < best[nprobe_slow - 1].0 {
-                best[nprobe_slow - 1] = (db, ci);
+            if dist < 0 {
+                continue;
+            }
+            let du = dist as u64;
+            if du < best[nprobe_slow - 1].0 {
+                best[nprobe_slow - 1] = (du, ci);
                 let mut i = nprobe_slow - 1;
                 while i > 0 && best[i].0 < best[i - 1].0 {
                     best.swap(i, i - 1);
@@ -426,8 +367,9 @@ mod tests {
         f.write_all(&(n as u32).to_le_bytes()).unwrap();
         f.write_all(&(DIMS as u32).to_le_bytes()).unwrap();
 
-        for _ in 0..DIMS {
-            f.write_all(&0.0f32.to_le_bytes()).unwrap();
+        let centroid_f32 = [0.0f32; DIMS];
+        for &v in &centroid_f32 {
+            f.write_all(&quantize(v).to_le_bytes()).unwrap();
         }
 
         f.write_all(&0u32.to_le_bytes()).unwrap();
@@ -465,6 +407,11 @@ mod tests {
         f.write_all(&1u32.to_le_bytes()).unwrap();
         f.write_all(&1u32.to_le_bytes()).unwrap();
         f.write_all(&13u32.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 28]).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 32]).unwrap();
+        f.write_all(&[0u8]).unwrap();
         f.flush().unwrap();
         let result = SearchIndex::open(f.path().to_str().unwrap());
         assert!(result.is_err());
@@ -528,5 +475,16 @@ mod tests {
         let dist = dist_scalar(&q, &[0u8; STRIDE]);
         let diff = quantize(-1.0) as i64;
         assert_eq!(dist, diff * diff);
+    }
+
+    #[test]
+    fn centroids_are_i16() {
+        let records: Vec<([f32; DIMS], u8)> = vec![([0.5f32; DIMS], 0)];
+        let f = make_index(&records);
+        let idx = SearchIndex::open(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(idx.k_clusters, 1);
+        for d in 0..DIMS {
+            assert_eq!(idx.centroids_i16[d], quantize(0.0));
+        }
     }
 }

@@ -1,14 +1,10 @@
-// This processor uses the references.json.gz file as a source.
-// - Uses k-means++ to find centroids
-// -
-
 use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF3";
+pub const IVF_MAGIC: &[u8; 8] = b"RINHIVF4";
 const DIMS: usize = 14;
 const NLIST: usize = 4096;
 const KMEANS_ITERS: usize = 25;
@@ -28,23 +24,31 @@ fn quantize(v: f32) -> i16 {
         .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
+fn quantize_vector(f32v: &[f32; DIMS]) -> [i16; DIMS] {
+    let mut out = [0i16; DIMS];
+    for (i, &v) in f32v.iter().enumerate() {
+        out[i] = quantize(v);
+    }
+    out
+}
+
 #[inline(always)]
-fn sq_dist_to_centroid(v: &[f32; DIMS], centroids_flat: &[f32], ci: usize) -> f32 {
+fn sq_dist_i16(v: &[i16; DIMS], centroids: &[i16], ci: usize) -> i64 {
     let base = ci * DIMS;
-    let mut d = 0.0f32;
+    let mut d: i64 = 0;
     for k in 0..DIMS {
-        let diff = v[k] - centroids_flat[base + k];
+        let diff = v[k] as i64 - centroids[base + k] as i64;
         d += diff * diff;
     }
     d
 }
 
 #[inline]
-fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
+fn nearest_i16(v: &[i16; DIMS], centroids: &[i16], nlist: usize) -> u32 {
     let mut best = 0u32;
-    let mut best_d = f32::MAX;
+    let mut best_d = i64::MAX;
     for ci in 0..nlist {
-        let d = sq_dist_to_centroid(v, centroids_flat, ci);
+        let d = sq_dist_i16(v, centroids, ci);
         if d < best_d {
             best_d = d;
             best = ci as u32;
@@ -53,10 +57,13 @@ fn nearest(v: &[f32; DIMS], centroids_flat: &[f32], nlist: usize) -> u32 {
     best
 }
 
-// k-means++ initialization: https://en.wikipedia.org/wiki/K-means%2B%2B
-fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Vec<f32> {
-    let mut flat = vec![0.0f32; nlist * DIMS];
-    let mut dmin = vec![f32::MAX; sample.len()];
+fn kmeans_pp_init_i16(
+    vectors: &[[i16; DIMS]],
+    sample: &[usize],
+    nlist: usize,
+) -> Vec<i16> {
+    let mut flat = vec![0i16; nlist * DIMS];
+    let mut dmin = vec![i64::MAX; sample.len()];
 
     flat[..DIMS].copy_from_slice(&vectors[sample[0]]);
 
@@ -64,9 +71,9 @@ fn kmeans_pp_init(vectors: &[[f32; DIMS]], sample: &[usize], nlist: usize) -> Ve
         let prev_base = (c - 1) * DIMS;
         for (i, &si) in sample.iter().enumerate() {
             let v = &vectors[si];
-            let mut d = 0.0f32;
+            let mut d: i64 = 0;
             for k in 0..DIMS {
-                let diff = v[k] - flat[prev_base + k];
+                let diff = v[k] as i64 - flat[prev_base + k] as i64;
                 d += diff * diff;
             }
             if d < dmin[i] {
@@ -118,12 +125,15 @@ fn main() {
     let n = refs.len();
     eprintln!("preprocessor: parsed {n} records");
 
-    let vectors: Vec<[f32; DIMS]> = refs.iter().map(|r| r.vector).collect();
+    let vectors_f32: Vec<[f32; DIMS]> = refs.iter().map(|r| r.vector).collect();
     let labels: Vec<u8> = refs
         .iter()
         .map(|r| if r.label == "fraud" { 1u8 } else { 0u8 })
         .collect();
     drop(refs);
+
+    let vectors: Vec<[i16; DIMS]> = vectors_f32.iter().map(quantize_vector).collect();
+    drop(vectors_f32);
 
     let nlist_actual = NLIST.min(n);
 
@@ -134,28 +144,17 @@ fn main() {
     );
 
     eprintln!("preprocessor: kmeans++ init...");
-    let mut centroids_flat = kmeans_pp_init(&vectors, &sample, nlist_actual);
+    let mut centroids_i16 = kmeans_pp_init_i16(&vectors, &sample, nlist_actual);
 
     let mut sample_assignments = vec![0u32; sample_size];
     let nthreads = rayon::current_num_threads();
 
-    // Now we do the k-means iterations. Each iteration consists of two steps:
-    // 1. Assign each sample vector to the nearest centroid (parallelized).
-    // 2. Update each centroid to be the mean of its assigned vectors (parallelized with reduction).
-    // We track how many vectors changed their assignment, and stop early if it reaches zero.
-    // This is the lloyd's algorithm variant of k-means.
-    // https://en.wikipedia.org/wiki/K-means
-    // Run Lloyd's k-means refinement loop over the sampled vectors.
-    // Each iteration assigns vectors to the nearest centroid, then recomputes
-    // each centroid as the mean of its assigned vectors.
     for iter in 0..KMEANS_ITERS {
-        // Step 1: assign each sampled vector to its nearest centroid.
         let new_assignments: Vec<u32> = sample
             .par_iter()
-            .map(|&si| nearest(&vectors[si], &centroids_flat, nlist_actual))
+            .map(|&si| nearest_i16(&vectors[si], &centroids_i16, nlist_actual))
             .collect();
 
-        // Count assignment changes so we can stop early once the clustering converges.
         let changed = new_assignments
             .iter()
             .zip(sample_assignments.iter())
@@ -163,14 +162,13 @@ fn main() {
             .count();
         sample_assignments = new_assignments;
 
-        // Step 2a: accumulate per-centroid sums and counts in thread-local buffers.
         let chunk = (sample_size + nthreads - 1) / nthreads;
-        let thread_results: Vec<(Vec<f64>, Vec<u32>)> = (0..nthreads)
+        let thread_results: Vec<(Vec<i64>, Vec<u32>)> = (0..nthreads)
             .into_par_iter()
             .map(|tid| {
                 let start = tid * chunk;
                 let end = (start + chunk).min(sample_size);
-                let mut local_sums = vec![0.0f64; nlist_actual * DIMS];
+                let mut local_sums = vec![0i64; nlist_actual * DIMS];
                 let mut local_counts = vec![0u32; nlist_actual];
                 for i in start..end {
                     let ci = sample_assignments[i] as usize;
@@ -178,15 +176,14 @@ fn main() {
                     let v = &vectors[sample[i]];
                     let base = ci * DIMS;
                     for d in 0..DIMS {
-                        local_sums[base + d] += v[d] as f64;
+                        local_sums[base + d] += v[d] as i64;
                     }
                 }
                 (local_sums, local_counts)
             })
             .collect();
 
-        // Step 2b: reduce the thread-local accumulators into global sums and counts.
-        let mut global_sums = vec![0.0f64; nlist_actual * DIMS];
+        let mut global_sums = vec![0i64; nlist_actual * DIMS];
         let mut global_counts = vec![0u32; nlist_actual];
         for (sums, counts) in &thread_results {
             for i in 0..nlist_actual * DIMS {
@@ -197,13 +194,12 @@ fn main() {
             }
         }
 
-        // Step 2c: divide sums by counts to update each centroid to its mean.
         for ci in 0..nlist_actual {
             if global_counts[ci] > 0 {
-                let inv = 1.0 / global_counts[ci] as f64;
                 let base = ci * DIMS;
                 for d in 0..DIMS {
-                    centroids_flat[base + d] = (global_sums[base + d] * inv) as f32;
+                    let mean = global_sums[base + d] as f64 / global_counts[ci] as f64;
+                    centroids_i16[base + d] = mean.round() as i16;
                 }
             }
         }
@@ -212,7 +208,6 @@ fn main() {
             "  iter {}/{KMEANS_ITERS}: {changed} reassignments",
             iter + 1
         );
-        // No assignment changes means the sampled clustering has converged.
         if changed == 0 {
             break;
         }
@@ -221,7 +216,7 @@ fn main() {
     eprintln!("preprocessor: assigning all {n} vectors to final centroids...");
     let assignments: Vec<u32> = vectors
         .par_iter()
-        .map(|v| nearest(v, &centroids_flat, nlist_actual))
+        .map(|v| nearest_i16(v, &centroids_i16, nlist_actual))
         .collect();
 
     eprintln!("preprocessor: sorting vectors by cluster...");
@@ -252,7 +247,7 @@ fn main() {
     writer.write_all(&(n as u32).to_le_bytes()).unwrap();
     writer.write_all(&(DIMS as u32).to_le_bytes()).unwrap();
 
-    for &v in &centroids_flat {
+    for &v in &centroids_i16 {
         writer.write_all(&v.to_le_bytes()).unwrap();
     }
 
@@ -262,7 +257,7 @@ fn main() {
 
     for &idx in &order {
         for &v in &vectors[idx] {
-            writer.write_all(&quantize(v).to_le_bytes()).unwrap();
+            writer.write_all(&v.to_le_bytes()).unwrap();
         }
         writer.write_all(&[0u8; 4]).unwrap();
     }
@@ -273,6 +268,6 @@ fn main() {
 
     writer.flush().unwrap();
 
-    let file_size = 20 + nlist_actual * DIMS * 4 + (nlist_actual + 1) * 4 + n * 32 + n;
+    let file_size = 20 + nlist_actual * DIMS * 2 + (nlist_actual + 1) * 4 + n * 32 + n;
     eprintln!("preprocessor: wrote {output_path} ({file_size} bytes, IVF NLIST={nlist_actual})");
 }
