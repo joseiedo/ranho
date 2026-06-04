@@ -1,2 +1,3 @@
 target/
+test/*.json
 resources/references.json.gz

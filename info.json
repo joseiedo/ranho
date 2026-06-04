@@ -1,7 +1,14 @@
 {
-    "participants": ["joseiedo"],
-    "social": ["https://github.com/joseiedo"],
-    "source-code-repo": "https://github.com/joseiedo/rinha-de-backend-2026",
-    "stack": ["rust", "nginx"],
-    "open_to_work": false
+	"participants": [
+		"joseiedo"
+	],
+	"social": [
+		"https://github.com/joseiedo"
+	],
+	"source-code-repo": "https://github.com/joseiedo/ranho",
+	"stack": [
+		"rust",
+		"nginx"
+	],
+	"open_to_work": false
 }
